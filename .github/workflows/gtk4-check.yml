@@ -4,12 +4,6 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - '*.c'
-      - '*.h'
-      - Makefile
-      - 'gtk4/**'
-      - '.github/workflows/gtk4-check.yml'
   push:
     branches:
       - main
