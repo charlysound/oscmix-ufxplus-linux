@@ -187,9 +187,11 @@ different maturity and are not all tested by this project's maintainer.
 
 ## Download
 
-This project does not publish stable releases yet. Build it from source as described
-below to retain the UFX+ fixes. Binaries published by the upstream project may
-behave differently.
+Pre-release source snapshots are available on the
+[Releases page](https://github.com/charlysound/oscmix-ufxplus-linux/releases).
+There are no stable or pre-built binary releases yet. Build from source as
+described below to retain the UFX+ fixes; binaries published by the upstream
+project may behave differently.
 
 ## Building
 
