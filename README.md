@@ -187,8 +187,8 @@ different maturity and are not all tested by this project's maintainer.
 
 ## Download
 
-Pre-release source snapshots and an `amd64` Debian package built on Ubuntu
-22.04 are available on the
+Pre-release source snapshots, an `amd64` Debian package and GTK4 UFX+ AppImages
+are available on the
 [Releases page](https://github.com/charlysound/oscmix-ufxplus-linux/releases).
 Install a downloaded package with:
 
@@ -196,9 +196,20 @@ Install a downloaded package with:
 sudo apt install ./oscmix-ufxplus_VERSION_amd64.deb
 ```
 
+Alternatively, make the AppImage for your architecture executable and run it:
+
+```shell
+chmod +x oscmix-ufxplus-gtk4-VERSION-x86_64.AppImage
+./oscmix-ufxplus-gtk4-VERSION-x86_64.AppImage
+```
+
+The AppImage bundles GTK4 and the application binaries. Device discovery still
+uses the host's ALSA utilities, so install `alsa-utils` if `aconnect` is not
+already available.
+
 There is no stable release yet. Build from source as described below when a
-package is not available for your architecture; binaries published by the
-upstream project may behave differently.
+package or AppImage is not available for your architecture; binaries published
+by the upstream project may behave differently.
 
 ## Building
 

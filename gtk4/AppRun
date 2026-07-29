@@ -7,6 +7,14 @@ BIN_DIR="$APP_DIR/bin"
 ENGINE="$BIN_DIR/oscmix"
 ALSASEQIO="$BIN_DIR/alsaseqio"
 UI="$BIN_DIR/oscmix-gtk4"
+
+# AppImages keep their bundled runtime libraries below the application root.
+# The Debian and local installations do not create this directory, so their
+# normal system-library lookup remains unchanged.
+if [ -d "$APP_DIR/usr/lib" ]; then
+	export LD_LIBRARY_PATH="$APP_DIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 BACKEND_PID=""
 BACKEND_PORT=""
 BACKEND_STARTED=0
