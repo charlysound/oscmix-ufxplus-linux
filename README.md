@@ -187,11 +187,18 @@ different maturity and are not all tested by this project's maintainer.
 
 ## Download
 
-Pre-release source snapshots are available on the
+Pre-release source snapshots and an `amd64` Debian package built on Ubuntu
+22.04 are available on the
 [Releases page](https://github.com/charlysound/oscmix-ufxplus-linux/releases).
-There are no stable or pre-built binary releases yet. Build from source as
-described below to retain the UFX+ fixes; binaries published by the upstream
-project may behave differently.
+Install a downloaded package with:
+
+```shell
+sudo apt install ./oscmix-ufxplus_VERSION_amd64.deb
+```
+
+There is no stable release yet. Build from source as described below when a
+package is not available for your architecture; binaries published by the
+upstream project may behave differently.
 
 ## Building
 
