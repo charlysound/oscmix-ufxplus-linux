@@ -38,7 +38,7 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install GTK 4 build dependencies
         run: |
           sudo apt-get update
@@ -67,7 +67,7 @@ jobs:
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
-            RELEASE_NAME="oscmix ${VERSION}"
+            RELEASE_NAME="oscmix UFX+ GTK4 ${VERSION}"
             RELEASE_TAG="${GITHUB_REF_NAME}"
             ARTIFACT_VERSION="${VERSION}"
             IS_TAG="true"
@@ -93,7 +93,7 @@ jobs:
       matrix:
         include:
           # Linux builds
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             platform: linux
             arch: x86_64
           - os: ubuntu-24.04-arm
@@ -116,7 +116,8 @@ jobs:
         run: |
           if [ "${{ matrix.platform }}" = "linux" ]; then
             sudo apt-get update
-            sudo apt-get install -y libasound2-dev pkg-config libgtk-3-dev libglib2.0-dev libavahi-client-dev clang lld wget
+            sudo apt-get install -y libasound2-dev pkg-config libgtk-3-dev \
+              libgtk-4-dev libglib2.0-dev libavahi-client-dev clang lld wget
             
             if [ "${{ matrix.arch }}" = "x86_64" ]; then
               echo "Fetching latest WASI SDK release for x86_64..."
@@ -147,6 +148,8 @@ jobs:
             make alsaseqio
             make tools/regtool
             make gtk
+            make gtk4
+            make -C gtk4 check
             
             if [ "${{ matrix.arch }}" = "x86_64" ] && [ -n "$WASM_CC" ]; then
               make -C web WASM_CC="$WASM_CC"
@@ -272,7 +275,7 @@ jobs:
           echo "ARTIFACT_PATH=${ARTIFACT_NAME}.tar.gz" >> $GITHUB_ENV
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.platform }}-${{ matrix.arch }}
           path: ${{ env.ARTIFACT_PATH }}
@@ -288,103 +291,102 @@ jobs:
 
       - name: Upload web artifact
         if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: web-wasm
           path: ${{ env.WEB_ARTIFACT_PATH }}
 
-      - name: Build AppImage (x86_64 Linux only)
-        if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
+      - name: Build UFX+ GTK4 AppImage
+        if: matrix.platform == 'linux'
+        env:
+          RELEASE_VERSION: ${{ needs.version-info.outputs.artifact_version }}
+          TARGET_ARCH: ${{ matrix.arch }}
         run: |
-          # Extract appimagetool instead of running directly (no FUSE on GH runners)
-          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -O appimagetool
+          if [ "$TARGET_ARCH" = x86_64 ]; then
+            appimage_arch=x86_64
+          else
+            appimage_arch=aarch64
+          fi
+
+          wget -q \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${appimage_arch}.AppImage" \
+            -O appimagetool
           chmod +x appimagetool
-          ./appimagetool --appimage-extract > /dev/null
-          APPIMAGETOOL="$PWD/squashfs-root/AppRun"
+          ./appimagetool --appimage-extract >/dev/null
+          mv squashfs-root appimagetool-root
+          appimagetool="$PWD/appimagetool-root/AppRun"
 
-          # Create AppDir structure
-          APPDIR="oscmix-gtk.AppDir"
-          mkdir -p "$APPDIR/usr/bin"
-          mkdir -p "$APPDIR/usr/share/oscmix"
-          mkdir -p "$APPDIR/usr/share/applications"
-          mkdir -p "$APPDIR/usr/share/icons/hicolor/scalable/apps"
+          appdir=oscmix-ufxplus-gtk4.AppDir
+          mkdir -p \
+            "$appdir/bin" \
+            "$appdir/usr/bin" \
+            "$appdir/usr/lib" \
+            "$appdir/usr/share/applications" \
+            "$appdir/usr/share/icons/hicolor/scalable/apps"
 
-          # Copy binaries
-          cp oscmix "$APPDIR/usr/bin/"
-          cp alsarawio "$APPDIR/usr/bin/"
-          cp alsaseqio "$APPDIR/usr/bin/"
-          cp gtk/oscmix-gtk "$APPDIR/usr/bin/"
+          install -m 755 oscmix "$appdir/bin/oscmix"
+          install -m 755 alsaseqio "$appdir/bin/alsaseqio"
+          install -m 755 gtk4/oscmix-gtk4 "$appdir/bin/oscmix-gtk4"
+          install -m 755 gtk4/AppRun "$appdir/AppRun"
+          strip --strip-unneeded \
+            "$appdir/bin/oscmix" \
+            "$appdir/bin/alsaseqio" \
+            "$appdir/bin/oscmix-gtk4"
+          ln -s ../../AppRun "$appdir/usr/bin/oscmix-ufxplus"
 
-          # Copy GTK resources
-          cp gtk/gschemas.compiled "$APPDIR/usr/share/oscmix/"
+          install -m 644 gtk/oscmix.svg "$appdir/oscmix-ufxplus.svg"
+          install -m 644 gtk/oscmix.svg \
+            "$appdir/usr/share/icons/hicolor/scalable/apps/oscmix-ufxplus.svg"
 
-          # Copy AppRun launcher script
-          cp gtk/AppRun "$APPDIR/AppRun"
-          chmod +x "$APPDIR/AppRun"
-
-          # Desktop entry (no leading whitespace – AppImage spec requires clean format)
-          cat > "$APPDIR/oscmix-gtk.desktop" <<'EOF'
+          cat >"$appdir/oscmix-ufxplus.desktop" <<'EOF'
           [Desktop Entry]
-          Name=oscmix-gtk
-          Exec=oscmix-gtk
-          Icon=oscmix
           Type=Application
-          Categories=AudioVideo;Audio;
-          Comment=OSC Mixer UI for RME Fireface devices
+          Version=1.0
+          Name=oscmix GTK4 – UFX+
+          GenericName=Fireface Mixer
+          Comment=Lightweight mixer for RME Fireface UFX+ in Class Compliant mode
+          Exec=oscmix-ufxplus
+          Icon=oscmix-ufxplus
+          Terminal=false
+          Categories=AudioVideo;Audio;Mixer;
+          Keywords=RME;Fireface;UFX;TotalMix;OSC;Mixer;
+          StartupNotify=true
           EOF
-          cp "$APPDIR/oscmix-gtk.desktop" "$APPDIR/usr/share/applications/oscmix-gtk.desktop"
+          cp "$appdir/oscmix-ufxplus.desktop" \
+            "$appdir/usr/share/applications/oscmix-ufxplus.desktop"
 
-          # Copy icon
-          cp gtk/oscmix.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/oscmix.svg"
-          cp gtk/oscmix.svg "$APPDIR/oscmix.svg"
+          {
+            ldd "$appdir/bin/oscmix"
+            ldd "$appdir/bin/alsaseqio"
+            ldd "$appdir/bin/oscmix-gtk4"
+          } | awk '/=> \// { print $3 }' | sort -u |
+          while IFS= read -r library; do
+            case "$(basename "$library")" in
+              libc.so.*|libdl.so.*|libm.so.*|libpthread.so.*|libresolv.so.*|\
+              librt.so.*|ld-linux-*.so.*)
+                continue
+                ;;
+            esac
+            cp -L "$library" "$appdir/usr/lib/"
+          done
 
-          # Build AppImage (ARCH must be set explicitly for appimagetool)
-          ARCH=x86_64 "$APPIMAGETOOL" "$APPDIR" "oscmix-gtk-${{ needs.version-info.outputs.artifact_version }}-x86_64.AppImage"
-          echo "APPIMAGE_PATH=oscmix-gtk-${{ needs.version-info.outputs.artifact_version }}-x86_64.AppImage" >> $GITHUB_ENV
+          test -e "$appdir/usr/lib/libgtk-4.so.1"
+          appimage="oscmix-ufxplus-gtk4-${RELEASE_VERSION}-${appimage_arch}.AppImage"
+          ARCH="$appimage_arch" "$appimagetool" "$appdir" "$appimage"
 
-      - name: Build AppImage (arm64 Linux only)
-        if: matrix.platform == 'linux' && matrix.arch == 'arm64'
-        run: |
-          # Extract appimagetool instead of running directly (no FUSE on GH runners)
-          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage" -O appimagetool
-          chmod +x appimagetool
-          ./appimagetool --appimage-extract > /dev/null
-          APPIMAGETOOL="$PWD/squashfs-root/AppRun"
+          "./$appimage" --appimage-extract >/dev/null
+          test -x squashfs-root/bin/oscmix
+          test -x squashfs-root/bin/alsaseqio
+          test -x squashfs-root/bin/oscmix-gtk4
+          test -e squashfs-root/usr/lib/libgtk-4.so.1
+          test ! -e squashfs-root/usr/bin/oscmix-gtk
+          squashfs-root/AppRun --list-devices
 
-          APPDIR="oscmix-gtk.AppDir"
-          mkdir -p "$APPDIR/usr/bin"
-          mkdir -p "$APPDIR/usr/share/oscmix"
-          mkdir -p "$APPDIR/usr/share/applications"
-          mkdir -p "$APPDIR/usr/share/icons/hicolor/scalable/apps"
-
-          cp oscmix "$APPDIR/usr/bin/"
-          cp alsarawio "$APPDIR/usr/bin/"
-          cp alsaseqio "$APPDIR/usr/bin/"
-          cp gtk/oscmix-gtk "$APPDIR/usr/bin/"
-          cp gtk/gschemas.compiled "$APPDIR/usr/share/oscmix/"
-          cp gtk/AppRun "$APPDIR/AppRun"
-          chmod +x "$APPDIR/AppRun"
-
-          cat > "$APPDIR/oscmix-gtk.desktop" <<'EOF'
-          [Desktop Entry]
-          Name=oscmix-gtk
-          Exec=oscmix-gtk
-          Icon=oscmix
-          Type=Application
-          Categories=AudioVideo;Audio;
-          Comment=OSC Mixer UI for RME Fireface devices
-          EOF
-          cp "$APPDIR/oscmix-gtk.desktop" "$APPDIR/usr/share/applications/oscmix-gtk.desktop"
-
-          cp gtk/oscmix.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/oscmix.svg"
-          cp gtk/oscmix.svg "$APPDIR/oscmix.svg"
-
-          ARCH=aarch64 "$APPIMAGETOOL" "$APPDIR" "oscmix-gtk-${{ needs.version-info.outputs.artifact_version }}-aarch64.AppImage"
-          echo "APPIMAGE_PATH=oscmix-gtk-${{ needs.version-info.outputs.artifact_version }}-aarch64.AppImage" >> $GITHUB_ENV
+          printf 'APPIMAGE_PATH=%s\n' "$appimage" >>"$GITHUB_ENV"
 
       - name: Upload AppImage artifact
         if: matrix.platform == 'linux'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: appimage-${{ matrix.arch }}
           path: ${{ env.APPIMAGE_PATH }}
@@ -403,7 +405,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download web artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: web-wasm
           path: web-artifact
@@ -472,7 +474,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
           pattern: '*'
@@ -481,7 +483,8 @@ jobs:
       - name: Create checksums
         run: |
           cd artifacts
-          find . -name "*.tar.gz" -exec sh -c 'sha256sum "{}" > "{}.sha256"' \;
+          find . -type f -name "oscmix-ufxplus-gtk4-*.AppImage" \
+            -exec sh -c 'sha256sum "$1" > "$1.sha256"' _ {} \;
 
       - name: Generate release notes
         id: release-notes
@@ -497,8 +500,20 @@ jobs:
           echo "body<<EOF" >> $GITHUB_OUTPUT
           echo "## 🎉 Release ${{ github.ref_name }}" >> $GITHUB_OUTPUT
           echo "" >> $GITHUB_OUTPUT
+          echo "UFX+-focused GTK4 preview for Linux." >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "### Downloads" >> $GITHUB_OUTPUT
+          echo "- Debian package for amd64, attached by the Debian packaging workflow" >> $GITHUB_OUTPUT
+          echo "- GTK4 AppImages for x86_64 and aarch64" >> $GITHUB_OUTPUT
+          echo "- GitHub-generated source archives" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "The AppImages include the GTK4 frontend, oscmix engine, ALSA sequencer bridge, UFX+ reconnecting launcher and GTK4 runtime libraries. Device discovery uses the host's \`aconnect\` command from \`alsa-utils\`." >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
           echo "### Changes since last release" >> $GITHUB_OUTPUT
           echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "### Safety" >> $GITHUB_OUTPUT
+          echo "This is experimental, unofficial remote-control software. Test with monitor levels reduced and keep a hardware mute available. The project is not affiliated with or endorsed by RME." >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
@@ -509,12 +524,10 @@ jobs:
           body: ${{ steps.release-notes.outputs.body }}
           prerelease: ${{ contains(needs.version-info.outputs.release_tag, '-') }}
           draft: false
-          make_latest: true
+          make_latest: false
           files: |
-            ./artifacts/**/*.tar.gz
-            ./artifacts/**/*.sha256
-            ./artifacts/**/*.AppImage
-            ./artifacts/**/*.dmg
+            ./artifacts/oscmix-ufxplus-gtk4-*.AppImage
+            ./artifacts/oscmix-ufxplus-gtk4-*.AppImage.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -531,7 +544,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
           pattern: '*'
@@ -540,7 +553,8 @@ jobs:
       - name: Create checksums
         run: |
           cd artifacts
-          find . -name "*.tar.gz" -exec sh -c 'sha256sum "{}" > "{}.sha256"' \;
+          find . -type f -name "oscmix-ufxplus-gtk4-*.AppImage" \
+            -exec sh -c 'sha256sum "$1" > "$1.sha256"' _ {} \;
 
       - name: Generate nightly release body
         id: generate-body
@@ -565,61 +579,13 @@ jobs:
           echo "$COMMITS" >> $GITHUB_OUTPUT
           echo "" >> $GITHUB_OUTPUT
           echo "### Download" >> $GITHUB_OUTPUT
-          echo "Pre-built binaries are available for the following platforms." >> $GITHUB_OUTPUT
-          echo "The respective oscmix-*.tar.gz package includes the following files:" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "**Linux (arm64 and x86_64)**" >> $GITHUB_OUTPUT
-          echo "- oscmix" >> $GITHUB_OUTPUT
-          echo "- alsarawio" >> $GITHUB_OUTPUT
-          echo "- alsaseqio" >> $GITHUB_OUTPUT
-          echo "- regtool" >> $GITHUB_OUTPUT
-          echo "- gtk/oscmix-gtk (incl. gtk/gschemas.compiled)" >> $GITHUB_OUTPUT
-          echo "- run-oscmix-gtk.sh (starts the binary above)" >> $GITHUB_OUTPUT
-          echo "- separate *.AppImage file contains all necessary files in a single app container (make it executable before starting)" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "**macOS (arm64 and x86_64)**" >> $GITHUB_OUTPUT
-          echo "- oscmix" >> $GITHUB_OUTPUT
-          echo "- coremidiio" >> $GITHUB_OUTPUT
-          echo "- regtool" >> $GITHUB_OUTPUT
-          echo "- oscmix-gtk.app" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "**WEB (for own webserver)**" >> $GITHUB_OUTPUT
-          echo "The pub-*.tar.gz package contains:" >> $GITHUB_OUTPUT
-          echo "- whole webdir and includes the corresponding WebAssembly (.wasm)" >> $GITHUB_OUTPUT
+          echo "GTK4 UFX+ AppImages are provided for x86_64 and aarch64 Linux." >> $GITHUB_OUTPUT
+          echo "They include the frontend, oscmix engine, ALSA sequencer bridge, reconnecting launcher and GTK4 runtime libraries." >> $GITHUB_OUTPUT
           echo "" >> $GITHUB_OUTPUT
           echo "### Installation" >> $GITHUB_OUTPUT
-          echo "**Linux/macOS:**" >> $GITHUB_OUTPUT
-          echo "1. Download the appropriate archive for your platform" >> $GITHUB_OUTPUT
-          echo "2. Extract: \`tar xzf oscmix-*.tar.gz\`" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "**Web:**" >> $GITHUB_OUTPUT
-          echo "1. Download the \`pub-*.tar.gz\` archive" >> $GITHUB_OUTPUT
-          echo "2. Extract to your web server directory (ssl is required for web-midi access in browsers)" >> $GITHUB_OUTPUT
-          echo "3. Access via browser. For example: \`https://your-server/oscmix/index.html\`" >> $GITHUB_OUTPUT
-          echo "4. Note: If you want to access your unit via web-midi only, running the oscmix bin is not needed." >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "### Running oscmix-gtk UI" >> $GITHUB_OUTPUT
-          echo "1. Run oscmix." >> $GITHUB_OUTPUT
-          echo "Refer to readme for details: https://github.com/huddx01/oscmix/tree/dev?tab=readme-ov-file#running" >> $GITHUB_OUTPUT
-          echo "2. Linux:" >> $GITHUB_OUTPUT
-          echo "2a. Start the script \`run-oscmix-gtk.sh\` in terminal" >> $GITHUB_OUTPUT
-          echo "2b. Or just execute the *.AppImage (it manages the alsarawio/alsaseqio/oscmix stuff automatically)" >> $GITHUB_OUTPUT
-          echo "3. macOS:" >> $GITHUB_OUTPUT
-          echo "Start the included \`oscmix-gtk.app\`" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "---" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "### 🧪 oscmix-qt - Preliminary Preview Builds (Qt UI)" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "> **⚠️ DANGER: Extremely early preview. Do not use in production.**" >> $GITHUB_OUTPUT
-          echo "> The Qt UI is at roughly 20% of planned functionality. Expect missing features, crashes, and breaking changes between builds. Strictly for interested testers." >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "Available as separate \`oscmixQt_*\` files below (AppImage / DMG)." >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "> **macOS users:** Ad-hoc signed — Gatekeeper will block on first launch." >> $GITHUB_OUTPUT
-          echo "> See [macOS Gatekeeper Workaround - doc will come soon](https://github.com/huddx01/oscmix/wiki/macOS-Gatekeeper-Workaround) for instructions." >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "> **Source code:** Qt frontend sources will be made public once they reach a representable state." >> $GITHUB_OUTPUT
+          echo "1. Download the AppImage for your architecture." >> $GITHUB_OUTPUT
+          echo "2. Make it executable with \`chmod +x FILE.AppImage\`." >> $GITHUB_OUTPUT
+          echo "3. Run it directly. Install \`alsa-utils\` if \`aconnect\` is unavailable." >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Delete old nightly release
@@ -629,7 +595,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Nightly GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version-info.outputs.release_tag }}
           name: ${{ needs.version-info.outputs.release_name }}
@@ -638,9 +604,7 @@ jobs:
           draft: false
           make_latest: false
           files: |
-            ./artifacts/**/*.tar.gz
-            ./artifacts/**/*.sha256
-            ./artifacts/**/*.AppImage
-            ./artifacts/**/*.dmg
+            ./artifacts/oscmix-ufxplus-gtk4-*.AppImage
+            ./artifacts/oscmix-ufxplus-gtk4-*.AppImage.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
