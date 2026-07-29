@@ -14,4 +14,5 @@
 /tools/regtool
 /web/oscmix.wasm
 /coremidiio
+/dist/
 .DS_Store

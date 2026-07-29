@@ -1,157 +1,121 @@
 #!/bin/sh
-# debian/build-deb.sh - builds oscmix_<version>_<arch>.deb
-# Run from repo root: ./debian/build-deb.sh [version]
-#
-# Version convention:
-#   Release:  0.0.1
-#   Alpha:    0.0.1~alpha1
-#   Custom:   0.0.1~custom202604051944 (default if no arg given)
-#   Nightly:  0.0.1~nightly20260405
+# Build the UFX+ GTK4 application as a Debian package.
+# Run from any directory: ./debian/build-deb.sh VERSION
 
-set -e
+set -eu
 
-VERSION=${1:-0.0.1~custom$(date +%Y%m%d%H%M)}
-ARCH=$(dpkg --print-architecture)
-PKG="oscmix_${VERSION}_${ARCH}"
-DOC_DIR="${PKG}/usr/share/doc/oscmix"
-
-# Color codes
-GREEN="\033[0;32m"
-CYAN="\033[0;36m"
-BOLD="\033[1m"
-RESET="\033[0m"
-
-printf "\n${GREEN}${BOLD}Building ${PKG}.deb ...${RESET}\n"
-
-# Build C backend
-make oscmix
-make alsarawio
-make alsaseqio
-
-# Build GTK UI
-make -C gtk
-
-# Stage package tree
-rm -rf "${PKG}"
-mkdir -p "${PKG}/DEBIAN"
-mkdir -p "${PKG}/usr/bin"
-mkdir -p "${PKG}/usr/share/glib-2.0/schemas"
-mkdir -p "${PKG}/usr/share/applications"
-mkdir -p "${PKG}/usr/share/icons/hicolor/512x512/apps"
-mkdir -p "${PKG}/usr/share/man/man1"
-mkdir -p "${DOC_DIR}"
-
-# Binaries
-cp oscmix alsarawio alsaseqio   "${PKG}/usr/bin/"
-cp gtk/oscmix-gtk               "${PKG}/usr/bin/"
-
-# Launcher (dual-mode AppRun: works in AppImage and as system binary)
-cp gtk/AppRun                   "${PKG}/usr/bin/oscmix-launcher"
-
-# GTK schema XML only postinst regenerates the system-wide gschemas.compiled
-cp gtk/oscmix.gschema.xml       "${PKG}/usr/share/glib-2.0/schemas/"
-
-cp "doc/img/AppIcon/AppIcon-Dark-512x512@1x.png" \
-                        "${PKG}/usr/share/icons/hicolor/512x512/apps/oscmix.png"
-
-# Man pages (gzip as required by Debian policy)
-for page in oscmix alsarawio alsaseqio coremidiio; do
-    gzip -9 -c "doc/${page}.1" > "${PKG}/usr/share/man/man1/${page}.1.gz"
-done
-
-# Desktop entry
-cat > "${PKG}/usr/share/applications/oscmix-gtk.desktop" <<EOF
-[Desktop Entry]
-Name=oscmix
-Exec=oscmix-launcher
-Icon=oscmix
-Type=Application
-Categories=AudioVideo;Audio;
-Comment=OSC Mixer UI for RME Fireface devices in CC-Mode
-EOF
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-
-# Ensure we run from repo root so make finds all sources
-cd "${REPO_ROOT}"
-
-# copyright file (read from debian/copyright, maintained separately)
-if [ ! -f "${SCRIPT_DIR}/copyright" ]; then
-    printf "Error: debian/copyright not found. Cannot build package.\n" >&2
-    exit 1
+if [ "$#" -ne 1 ]; then
+	printf 'Usage: %s VERSION\n' "$0" >&2
+	printf 'Example: %s 0.1.0~alpha2-1\n' "$0" >&2
+	exit 2
 fi
-cp "${SCRIPT_DIR}/copyright" "${DOC_DIR}/copyright"
 
-# changelog (generated from git log, gzip as required by Debian policy)
-# Format: package (version) distro; urgency=low
-#   * commit message
-#  -- Maintainer <email>  date
-generate_changelog() {
-    local pkg_version="$1"
-    printf "oscmix (%s) unstable; urgency=low\n" "$pkg_version"
-    printf "\n"
-    # Last 20 commits, one bullet per commit
-    git log --no-walk=unsorted --format="  * %s" -20 2>/dev/null \
-        || printf "  * Initial release\n"
-    printf "\n"
-    printf " -- M. Augustyniak <meg33@sndtek.de>  %s\n" \
-        "$(date -R)"
+VERSION=$1
+case "$VERSION" in
+	[0-9]*)
+		;;
+	*)
+		printf 'Error: Debian package versions must start with a digit.\n' >&2
+		exit 2
+		;;
+esac
+case "$VERSION" in
+	*[!0-9A-Za-z.+:~-]*)
+		printf 'Error: unsupported character in package version: %s\n' "$VERSION" >&2
+		exit 2
+		;;
+esac
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)
+ARCH=$(dpkg --print-architecture)
+PACKAGE=oscmix-ufxplus
+APP_DIR=/usr/lib/oscmix-ufxplus
+OUTPUT_DIR="${REPO_ROOT}/dist"
+OUTPUT="${OUTPUT_DIR}/${PACKAGE}_${VERSION}_${ARCH}.deb"
+BUILD_ROOT=$(mktemp -d)
+PACKAGE_ROOT="${BUILD_ROOT}/${PACKAGE}"
+DOC_DIR="${PACKAGE_ROOT}/usr/share/doc/${PACKAGE}"
+
+cleanup()
+{
+	rm -rf -- "$BUILD_ROOT"
 }
-generate_changelog "$VERSION" | gzip -9 > "${DOC_DIR}/changelog.Debian.gz"
+trap cleanup EXIT HUP INT TERM
 
-# postinst: regenerate system-wide gschemas.compiled after install
-cat > "${PKG}/DEBIAN/postinst" <<EOF
-#!/bin/sh
-glib-compile-schemas /usr/share/glib-2.0/schemas/ || true
+cd "$REPO_ROOT"
+
+printf 'Building oscmix GTK4 and its UFX+ backend...\n'
+make -j"${JOBS:-2}" oscmix alsaseqio gtk4
+make -C gtk4 check
+
+install -d \
+	"${PACKAGE_ROOT}${APP_DIR}/bin" \
+	"${PACKAGE_ROOT}/usr/bin" \
+	"${PACKAGE_ROOT}/usr/share/applications" \
+	"${PACKAGE_ROOT}/usr/share/icons/hicolor/scalable/apps" \
+	"$DOC_DIR" \
+	"${PACKAGE_ROOT}/DEBIAN" \
+	"$OUTPUT_DIR"
+
+install -m 755 oscmix "${PACKAGE_ROOT}${APP_DIR}/bin/oscmix"
+install -m 755 alsaseqio "${PACKAGE_ROOT}${APP_DIR}/bin/alsaseqio"
+install -m 755 gtk4/oscmix-gtk4 "${PACKAGE_ROOT}${APP_DIR}/bin/oscmix-gtk4"
+install -m 755 gtk4/AppRun "${PACKAGE_ROOT}${APP_DIR}/AppRun"
+strip --strip-unneeded \
+	"${PACKAGE_ROOT}${APP_DIR}/bin/oscmix" \
+	"${PACKAGE_ROOT}${APP_DIR}/bin/alsaseqio" \
+	"${PACKAGE_ROOT}${APP_DIR}/bin/oscmix-gtk4"
+ln -s "${APP_DIR}/AppRun" "${PACKAGE_ROOT}/usr/bin/oscmix-ufxplus"
+
+install -m 644 gtk/oscmix.svg \
+	"${PACKAGE_ROOT}/usr/share/icons/hicolor/scalable/apps/oscmix-ufxplus.svg"
+install -m 644 debian/copyright "${DOC_DIR}/copyright"
+install -m 644 README.md "${DOC_DIR}/README.md"
+
+cat >"${PACKAGE_ROOT}/usr/share/applications/oscmix-ufxplus.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=oscmix GTK4 – UFX+
+GenericName=Fireface Mixer
+Comment=Lightweight mixer for RME Fireface UFX+ in Class Compliant mode
+Exec=oscmix-ufxplus
+Icon=oscmix-ufxplus
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=RME;Fireface;UFX;TotalMix;OSC;Mixer;
+StartupNotify=true
 EOF
+chmod 644 "${PACKAGE_ROOT}/usr/share/applications/oscmix-ufxplus.desktop"
 
-# postrm: regenerate system-wide gschemas.compiled after uninstall
-cat > "${PKG}/DEBIAN/postrm" <<EOF
-#!/bin/sh
-glib-compile-schemas /usr/share/glib-2.0/schemas/ || true
-EOF
-
-# Normalize permissions
-chmod 755 "${PKG}/DEBIAN/postinst"
-chmod 755 "${PKG}/DEBIAN/postrm"
-chmod 755 "${PKG}/usr/bin/oscmix"
-chmod 755 "${PKG}/usr/bin/alsarawio"
-chmod 755 "${PKG}/usr/bin/alsaseqio"
-chmod 755 "${PKG}/usr/bin/oscmix-gtk"
-chmod 755 "${PKG}/usr/bin/oscmix-launcher"
-chmod 644 "${PKG}/usr/share/glib-2.0/schemas/oscmix.gschema.xml"
-chmod 644 "${PKG}/usr/share/icons/hicolor/512x512/apps/oscmix.png"
-chmod 644 "${PKG}/usr/share/applications/oscmix-gtk.desktop"
-chmod 644 "${PKG}"/usr/share/man/man1/*.gz
-chmod 644 "${DOC_DIR}/copyright"
+{
+	printf '%s (%s) unstable; urgency=medium\n\n' "$PACKAGE" "$VERSION"
+	git log --format='  * %s' -10
+	printf '\n -- charlysound <151044893+charlysound@users.noreply.github.com>  %s\n' \
+		"$(date -R)"
+} | gzip -9 -n >"${DOC_DIR}/changelog.Debian.gz"
 chmod 644 "${DOC_DIR}/changelog.Debian.gz"
 
-# DEBIAN/control
-cat > "${PKG}/DEBIAN/control" <<EOF
-Package: oscmix
+INSTALLED_SIZE=$(du -sk "$PACKAGE_ROOT" | cut -f1)
+cat >"${PACKAGE_ROOT}/DEBIAN/control" <<EOF
+Package: ${PACKAGE}
 Version: ${VERSION}
 Section: sound
 Priority: optional
 Architecture: ${ARCH}
-Depends: libgtk-3-0, libglib2.0-0, libasound2, zenity
-Maintainer: M. Augustyniak <meg33@sndtek.de>
-Homepage: https://github.com/huddx01/oscmix
-Description: OSC Mixer UI for RME Fireface devices in CC-Mode
- GTK frontend for oscmix, currently supported:
- RME Fireface 802, UCX, UCX II, UFX, UFX II, UFX III, UFX+.
+Installed-Size: ${INSTALLED_SIZE}
+Depends: bash, alsa-utils, iproute2, libasound2, libavahi-client3, libgtk-4-1 (>= 4.6), zenity
+Maintainer: charlysound <151044893+charlysound@users.noreply.github.com>
+Homepage: https://github.com/charlysound/oscmix-ufxplus-linux
+Description: GTK4 mixer for RME Fireface UFX+ on Linux
+ Unofficial lightweight mixer and OSC/MIDI control frontend for the RME
+ Fireface UFX+ connected over USB in Class Compliant mode.
  .
- oscmix implements an OSC bridge for RME Fireface devices running in
- class-compliant mode on Linux and macOS.
- .
- Screenshot: https://raw.githubusercontent.com/huddx01/oscmix/main/doc/gtk.png
-
+ This package includes the GTK4 frontend, oscmix engine, ALSA sequencer bridge
+ and a desktop launcher with automatic UFX+ discovery and reconnection.
 EOF
+chmod 644 "${PACKAGE_ROOT}/DEBIAN/control"
 
-dpkg-deb --root-owner-group --build "${PKG}"
-
-printf "\n${GREEN}${BOLD}✓ Done: ${PKG}.deb${RESET}\n"
-printf "\n${BOLD}Install:${RESET}\n"
-printf "  ${CYAN}sudo dpkg -i ${PKG}.deb${RESET}\n"
-printf "\n${BOLD}Uninstall:${RESET}\n"
-printf "  ${CYAN}sudo dpkg -r oscmix${RESET}\n\n"
+dpkg-deb --root-owner-group --build "$PACKAGE_ROOT" "$OUTPUT"
+printf 'Built %s\n' "$OUTPUT"
