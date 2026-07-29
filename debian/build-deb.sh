@@ -32,7 +32,10 @@ ARCH=$(dpkg --print-architecture)
 PACKAGE=oscmix-ufxplus
 APP_DIR=/usr/lib/oscmix-ufxplus
 OUTPUT_DIR="${REPO_ROOT}/dist"
-OUTPUT="${OUTPUT_DIR}/${PACKAGE}_${VERSION}_${ARCH}.deb"
+# GitHub normalizes '~' in uploaded asset names. Use the normalized spelling
+# for the filename while retaining the Debian ordering character in metadata.
+FILE_VERSION=$(printf '%s' "$VERSION" | tr '~' '.')
+OUTPUT="${OUTPUT_DIR}/${PACKAGE}_${FILE_VERSION}_${ARCH}.deb"
 BUILD_ROOT=$(mktemp -d)
 PACKAGE_ROOT="${BUILD_ROOT}/${PACKAGE}"
 DOC_DIR="${PACKAGE_ROOT}/usr/share/doc/${PACKAGE}"
