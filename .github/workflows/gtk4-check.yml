@@ -1,0 +1,47 @@
+name: GTK4 checks
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '*.c'
+      - '*.h'
+      - Makefile
+      - 'gtk4/**'
+      - '.github/workflows/gtk4-check.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - '*.c'
+      - '*.h'
+      - Makefile
+      - 'gtk4/**'
+      - '.github/workflows/gtk4-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: GTK4 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-4-dev
+      - name: Build GTK4 frontend
+        run: make gtk4
+      - name: Run GTK4 tests
+        run: make -C gtk4 check

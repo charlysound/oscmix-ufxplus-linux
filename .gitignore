@@ -1,0 +1,17 @@
+*.o
+*.d
+/oscmix
+/alsarawio
+/alsaseqio
+/wsdgram
+/config.mk
+/gtk/oscmix-gtk
+/gtk/resources.c
+/gtk/gschemas.compiled
+/gtk4/oscmix-gtk4
+/gtk4/model-test
+/gtk4/transport-test
+/tools/regtool
+/web/oscmix.wasm
+/coremidiio
+.DS_Store

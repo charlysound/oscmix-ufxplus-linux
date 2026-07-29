@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+	<gresource prefix="/oscmix">
+		<file>oscmix.ui</file>
+		<file>oscmix.css</file>
+		<file>channel.ui</file>
+		<file>scaleentry.ui</file>
+		<file>eq-peak.svg</file>
+		<file>eq-lowshelf.svg</file>
+		<file>eq-highshelf.svg</file>
+		<file>eq-lowpass.svg</file>
+		<file>eq-highpass.svg</file>
+	</gresource>
+</gresources>

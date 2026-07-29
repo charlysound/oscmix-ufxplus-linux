@@ -1,0 +1,207 @@
+#!/bin/bash
+
+set -u
+
+APP_DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+BIN_DIR="$APP_DIR/bin"
+ENGINE="$BIN_DIR/oscmix"
+ALSASEQIO="$BIN_DIR/alsaseqio"
+UI="$BIN_DIR/oscmix-gtk4"
+BACKEND_PID=""
+BACKEND_PORT=""
+BACKEND_STARTED=0
+UI_PID=""
+
+stop_backend() {
+	if [ -n "$BACKEND_PID" ]; then
+		if kill -0 "$BACKEND_PID" 2>/dev/null; then
+			kill "$BACKEND_PID" 2>/dev/null || true
+		fi
+		wait "$BACKEND_PID" 2>/dev/null || true
+	fi
+	BACKEND_PID=""
+	BACKEND_PORT=""
+}
+
+cleanup() {
+	stop_backend
+	if [ -n "$UI_PID" ] && kill -0 "$UI_PID" 2>/dev/null; then
+		kill "$UI_PID" 2>/dev/null || true
+		wait "$UI_PID" 2>/dev/null || true
+	fi
+}
+
+terminate() {
+	exit 0
+}
+
+trap cleanup EXIT
+trap terminate INT TERM
+
+find_free_ports() {
+    local recv=7222
+    local send=8222
+
+    while ss -uln 2>/dev/null | awk '{print $5}' | grep -qE ":(${recv}|${send})$"; do
+        recv=$((recv + 1))
+        send=$((send + 1))
+    done
+    printf '%s %s\n' "$recv" "$send"
+}
+
+find_ufxp_ports() {
+    local current_client=""
+    local current_name=""
+    local last_port=""
+    local parsed_client=""
+    local line
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^client[[:space:]]+([0-9]+): ]]; then
+			parsed_client="${BASH_REMATCH[1]}"
+            if [ -n "$current_client" ] && [ -n "$last_port" ]; then
+                printf '%s:%s|%s\n' "$current_client" "$last_port" "$current_name"
+            fi
+            current_client=""
+            current_name=""
+            last_port=""
+            if [[ "$line" == *"Fireface UFX+"* ]]; then
+                current_client="$parsed_client"
+                current_name=$(sed "s/client [0-9]*: '//;s/' .*//" <<< "$line")
+            fi
+        elif [ -n "$current_client" ] && [[ "$line" =~ ^[[:space:]]+([0-9]+)[[:space:]]+\' ]]; then
+            last_port="${BASH_REMATCH[1]}"
+        fi
+    done < <(aconnect -l 2>/dev/null)
+    if [ -n "$current_client" ] && [ -n "$last_port" ]; then
+        printf '%s:%s|%s\n' "$current_client" "$last_port" "$current_name"
+    fi
+}
+
+if [ "${1:-}" = "--list-devices" ]; then
+    find_ufxp_ports
+    exit 0
+fi
+
+if [ ! -x "$UI" ] || [ ! -x "$ENGINE" ] || [ ! -x "$ALSASEQIO" ]; then
+    zenity --error --title="oscmix GTK4" \
+        --text="Incomplete installation in:\n$APP_DIR" --width=420 2>/dev/null
+    exit 1
+fi
+
+mapfile -t DEVICES < <(find_ufxp_ports)
+read -r OSC_RECV OSC_SEND <<< "$(find_free_ports)"
+
+SELECTED=""
+SELECTED_NAME=""
+if [ "${#DEVICES[@]}" -gt 0 ]; then
+	SELECTED="${DEVICES[0]}"
+fi
+if [ "${#DEVICES[@]}" -gt 1 ]; then
+	if command -v zenity >/dev/null 2>&1; then
+		ZENITY_ARGS=()
+		for entry in "${DEVICES[@]}"; do
+			ZENITY_ARGS+=("${entry%%|*}" "${entry##*|}")
+		done
+		SELECTED_PORT=$(zenity --list --title="oscmix GTK4 — UFX+" \
+			--text="Choose the Fireface to control" \
+			--column="ALSA port" --column="Interface" "${ZENITY_ARGS[@]}" \
+			--width=520 --height=300 2>/dev/null) || exit 0
+		for entry in "${DEVICES[@]}"; do
+			if [ "${entry%%|*}" = "$SELECTED_PORT" ]; then
+				SELECTED="$entry"
+				break
+			fi
+		done
+	fi
+fi
+if [ -n "$SELECTED" ]; then
+	SELECTED_NAME="${SELECTED##*|}"
+fi
+
+LOG_FILE="${XDG_RUNTIME_DIR:-/tmp}/oscmix-gtk4-${UID}-${OSC_RECV}.log"
+CURRENT_PORT=""
+OBSERVED_PORT=""
+OBSERVED_COUNT=0
+NEXT_RETRY=0
+RETRY_DELAY=1
+
+refresh_selected_port() {
+	local entry
+	local name
+
+	CURRENT_PORT=""
+	mapfile -t DEVICES < <(find_ufxp_ports)
+	if [ -z "$SELECTED_NAME" ] && [ "${#DEVICES[@]}" -gt 0 ]; then
+		SELECTED_NAME="${DEVICES[0]##*|}"
+	fi
+	for entry in "${DEVICES[@]}"; do
+		name="${entry##*|}"
+		if [ "$name" = "$SELECTED_NAME" ]; then
+			CURRENT_PORT="${entry%%|*}"
+			break
+		fi
+	done
+}
+
+start_backend() {
+	local device_port=$1
+
+	printf '%(%Y-%m-%dT%H:%M:%S%z)T connecting %s at ALSA %s\n' \
+		-1 "$SELECTED_NAME" "$device_port" >>"$LOG_FILE"
+	"$ALSASEQIO" "$device_port" "$ENGINE" \
+		-r "udp!127.0.0.1!${OSC_RECV}" \
+		-s "udp!127.0.0.1!${OSC_SEND}" >>"$LOG_FILE" 2>&1 &
+	BACKEND_PID=$!
+	BACKEND_PORT="$device_port"
+	BACKEND_STARTED=$SECONDS
+}
+
+"$UI" --send-port "$OSC_RECV" --recv-port "$OSC_SEND" &
+UI_PID=$!
+
+while kill -0 "$UI_PID" 2>/dev/null; do
+	refresh_selected_port
+	if [ -z "$CURRENT_PORT" ]; then
+		OBSERVED_PORT=""
+		OBSERVED_COUNT=0
+		if [ -n "$BACKEND_PID" ]; then
+			stop_backend
+			RETRY_DELAY=1
+		fi
+	else
+		if [ "$CURRENT_PORT" = "$OBSERVED_PORT" ]; then
+			OBSERVED_COUNT=$((OBSERVED_COUNT + 1))
+		else
+			OBSERVED_PORT="$CURRENT_PORT"
+			OBSERVED_COUNT=1
+		fi
+
+		if [ -n "$BACKEND_PID" ] && ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+			wait "$BACKEND_PID" 2>/dev/null || true
+			BACKEND_PID=""
+			BACKEND_PORT=""
+			NEXT_RETRY=$((SECONDS + RETRY_DELAY))
+			RETRY_DELAY=$((RETRY_DELAY < 8 ? RETRY_DELAY * 2 : 8))
+		fi
+		if [ -n "$BACKEND_PID" ] && [ "$BACKEND_PORT" != "$CURRENT_PORT" ]; then
+			stop_backend
+			NEXT_RETRY=$SECONDS
+			RETRY_DELAY=1
+		fi
+		if [ -n "$BACKEND_PID" ] &&
+		   [ $((SECONDS - BACKEND_STARTED)) -ge 3 ]; then
+			RETRY_DELAY=1
+		fi
+		if [ -z "$BACKEND_PID" ] && [ "$OBSERVED_COUNT" -ge 2 ] &&
+		   [ "$SECONDS" -ge "$NEXT_RETRY" ]; then
+			start_backend "$CURRENT_PORT"
+		fi
+	fi
+	sleep 0.5
+done
+
+UI_STATUS=0
+wait "$UI_PID" || UI_STATUS=$?
+UI_PID=""
+exit "$UI_STATUS"

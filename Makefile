@@ -1,0 +1,195 @@
+.POSIX:
+
+CC=cc -std=c11
+PREFIX=/usr/local
+BINDIR=$(PREFIX)/bin
+MANDIR=$(PREFIX)/share/man
+
+-include config.mk
+
+OS!=uname
+OS?=$(shell uname)
+OS-$(OS)=y
+
+ARCH!=uname -m
+ARCH?=$(shell uname -m)
+
+ALSA?=$(OS-Linux)
+ALSA_CFLAGS?=$$(pkg-config --cflags alsa)
+ALSA_LDFLAGS?=$$(pkg-config --libs-only-L --libs-only-other alsa)
+ALSA_LDLIBS?=$$(pkg-config --libs-only-l alsa)
+
+COREMIDI?=$(OS-Darwin)
+COREMIDI_LDLIBS?=-framework CoreMIDI -framework CoreFoundation
+
+AVAHI?=$(OS-Linux)
+AVAHI_CFLAGS?=$$(pkg-config --cflags avahi-client)
+AVAHI_LDFLAGS?=$$(pkg-config --libs-only-L --libs-only-other avahi-client)
+AVAHI_LDLIBS?=$$(pkg-config --libs-only-l avahi-client) -lpthread
+
+BONJOUR?=$(OS-Darwin)
+BONJOUR_LDLIBS?=-lpthread
+
+MDNS_OBJ-$(AVAHI)=   mdns_avahi.o
+MDNS_OBJ-$(BONJOUR)= mdns_bonjour.o
+MDNS_CFLAGS-$(AVAHI)=   $(AVAHI_CFLAGS) -DHAVE_MDNS
+MDNS_CFLAGS-$(BONJOUR)= -DHAVE_MDNS
+MDNS_LDFLAGS-$(AVAHI)=  $(AVAHI_LDFLAGS)
+MDNS_LDLIBS-$(AVAHI)=   $(AVAHI_LDLIBS)
+MDNS_LDLIBS-$(BONJOUR)= $(BONJOUR_LDLIBS)
+
+REGTOOL_GENERIC_LIBS-$(OS-Linux)=$(ALSA_LDFLAGS) $(ALSA_LDLIBS)
+REGTOOL_GENERIC_LIBS-$(OS-Darwin)=fatal.o $(COREMIDI_LDLIBS)
+
+LIBUSB?=y
+LIBUSB_CFLAGS?=$$(pkg-config --cflags libusb-1.0)
+LIBUSB_LDFLAGS?=$$(pkg-config --libs-only-L --libs-only-other libusb-1.0)
+LIBUSB_LDLIBS?=$$(pkg-config --libs-only-l libusb-1.0)
+
+GTK?=y
+WEB?=n
+
+BIN=oscmix $(BIN-y)
+BIN-$(ALSA)+=alsarawio alsaseqio
+BIN-$(COREMIDI)+=coremidiio
+BIN-$(WEB)+=wsdgram
+
+TARGET=$(BIN) $(TARGET-y)
+TARGET-$(GTK)+=gtk
+TARGET-$(WEB)+=web
+
+all: $(TARGET)
+
+.PHONY: gtk
+gtk:
+	$(MAKE) -C gtk
+
+.PHONY: gtk4
+gtk4:
+	$(MAKE) -C gtk4
+
+.PHONY: web
+web:
+	$(MAKE) -C web
+
+DEVICES=\
+	device_ff802.o\
+	device_ffucx.o\
+	device_ffucxii.o\
+	device_ffufx.o\
+	device_ffufxii.o\
+	device_ffufxiii.o\
+	device_ffufxp.o
+
+OSCMIX_OBJ=\
+	main.o\
+	osc.o\
+	oscmix.o\
+	socket.o\
+	sysex.o\
+	util.o\
+	$(MDNS_OBJ-y)\
+	$(DEVICES)
+
+WSDGRAM_OBJ=\
+	wsdgram.o\
+	base64.o\
+	http.o\
+	sha1.o\
+	socket.o\
+	util.o
+
+COREMIDIIO_OBJ=\
+	coremidiio.o\
+	fatal.o\
+	spawn.o
+
+REGTOOL_GENERIC_OBJ-$(OS-Darwin)=\
+	fatal.o
+
+REGTOOL_GENERIC_OBJ-$(OS-Linux)=
+
+oscmix.o $(DEVICES): device.h
+
+main.o: main.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(MDNS_CFLAGS-y) -c -o $@ main.c
+
+mdns_avahi.o: mdns_avahi.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(AVAHI_CFLAGS) -c -o $@ mdns_avahi.c
+
+mdns_bonjour.o: mdns_bonjour.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ mdns_bonjour.c
+
+oscmix: $(OSCMIX_OBJ)
+	$(CC) $(LDFLAGS) $(MDNS_LDFLAGS-y) -o $@ $(OSCMIX_OBJ) -lm $(MDNS_LDLIBS-y)
+
+wsdgram: $(WSDGRAM_OBJ)
+	$(CC) $(LDFLAGS) -o $@ $(WSDGRAM_OBJ) -l pthread
+
+alsarawio: alsarawio.o
+	$(CC) $(LDFLAGS) -o $@ alsarawio.o
+
+alsaseqio.o: alsaseqio.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(ALSA_CFLAGS) -c -o $@ alsaseqio.c
+
+alsaseqio: alsaseqio.o
+	$(CC) $(LDFLAGS) $(ALSA_LDFLAGS) -o $@ alsaseqio.o $(ALSA_LDLIBS) -l pthread
+
+coremidiio.o: coremidiio.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ coremidiio.c
+
+fatal.o: fatal.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ fatal.c
+
+spawn.o: spawn.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ spawn.c
+
+coremidiio: $(COREMIDIIO_OBJ)
+	$(CC) $(LDFLAGS) -o $@ $(COREMIDIIO_OBJ) $(COREMIDI_LDLIBS)
+
+tools/regtool.o: tools/regtool.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(ALSA_CFLAGS) -c -o $@ tools/regtool.c
+
+tools/regtool: tools/regtool.o
+	$(CC) $(LDFLAGS) $(ALSA_LDFLAGS) -o $@ tools/regtool.o $(ALSA_LDLIBS)
+
+tools/regtool_generic: tools/regtool_generic.o $(REGTOOL_GENERIC_OBJ-y)
+	$(CC) $(LDFLAGS) -o $@ tools/regtool_generic.o $(REGTOOL_GENERIC_LIBS-y)
+
+tools/regtool_usb.o: tools/regtool_usb.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LIBUSB_CFLAGS) -c -o $@ tools/regtool_usb.c
+
+tools/regtool_usb: tools/regtool_usb.o
+	$(CC) $(LDFLAGS) $(LIBUSB_LDFLAGS) -o $@ tools/regtool_usb.o $(LIBUSB_LDLIBS) -lpthread
+
+tools/usbdesc.o: tools/usbdesc.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LIBUSB_CFLAGS) -c -o $@ tools/usbdesc.c
+
+tools/usbdesc: tools/usbdesc.o
+	$(CC) $(LDFLAGS) $(LIBUSB_LDFLAGS) -o $@ tools/usbdesc.o $(LIBUSB_LDLIBS)
+
+.PHONY: install
+install: $(BIN)
+	mkdir -p $(DESTDIR)$(BINDIR)
+	cp $(BIN) $(DESTDIR)$(BINDIR)/
+	mkdir -p $(DESTDIR)$(MANDIR)/man1
+	cp doc/oscmix.1 $(DESTDIR)$(MANDIR)/man1/
+	cp doc/alsarawio.1 $(DESTDIR)$(MANDIR)/man1/
+	cp doc/alsaseqio.1 $(DESTDIR)$(MANDIR)/man1/
+	cp doc/coremidiio.1 $(DESTDIR)$(MANDIR)/man1/
+
+.PHONY: clean
+clean:
+	rm -f oscmix $(OSCMIX_OBJ)\
+		wsdgram $(WSDGRAM_OBJ)\
+		alsarawio alsarawio.o\
+		alsaseqio alsaseqio.o\
+		coremidiio coremidiio.o fatal.o spawn.o\
+		tools/regtool tools/regtool.o\
+		tools/regtool_generic tools/regtool_generic.o\
+		tools/regtool_usb tools/regtool_usb.o\
+		tools/usbdesc tools/usbdesc.o
+
+	$(MAKE) -C gtk clean
+	$(MAKE) -C gtk4 clean
+	$(MAKE) -C web clean

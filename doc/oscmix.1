@@ -1,0 +1,186 @@
+.Dd April 19, 2026
+.Dt OSCMIX 1
+.Os
+.Sh NAME
+.Nm oscmix
+.Nd RME Fireface mixer OSC bridge
+.Sh SYNOPSIS
+.Nm
+.Op Fl dhlz
+.Op Fl m Op Ar port
+.Op Fl p Ar midiport
+.Op Fl r Ar recvaddr
+.Op Fl s Ar sendaddr
+.Sh DESCRIPTION
+.Nm
+implements an OSC API for RME Fireface devices running in
+class-compliant mode, allowing full control of the device through OSC.
+.Pp
+It expects file descriptors 6 and 7 to be open for reading and
+writing MIDI messages to the device.
+To set these up on Linux, use
+.Xr alsarawio 1
+or
+.Xr alsaseqio 1 .
+On macOS, use
+.Xr coremidiio 1 .
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl d
+Enable debug messages.
+.It Fl h
+Show help and exit.
+.It Fl l
+Disable level meters.
+.It Fl m Op Ar port
+Send OSC updates to the multicast address
+.Cm 224.0.0.1
+on the given
+.Ar port
+(default:
+.Cm 8222 ) .
+Shorthand for
+.Fl s Cm udp!224.0.0.1! Ns Ar port .
+Multiple clients can receive updates simultaneously by joining the
+multicast group.
+.It Fl p Ar midiport
+The MIDI port name to connect to.
+If not specified,
+.Nm
+uses the value of the
+.Ev MIDIPORT
+environment variable (set automatically by
+.Xr alsarawio 1
+and
+.Xr alsaseqio 1 ) .
+.It Fl r Ar recvaddr
+The address on which to listen for incoming OSC messages from clients.
+Defaults to
+.Cm udp!127.0.0.1!7222 .
+.It Fl s Ar sendaddr
+The address to which
+.Nm
+sends OSC updates.
+Defaults to
+.Cm udp!127.0.0.1!8222 .
+Use a multicast address (224.0.0.0/4) to broadcast to multiple clients.
+.It Fl z
+Register the OSC service via mDNS/DNS-SD as
+.Cm _osc._udp
+so that clients on the local network can discover it automatically.
+On Linux this requires Avahi; on macOS Bonjour is used.
+The TXT record contains device metadata (id, uid, flags, inputs, outputs,
+recvport, sendport, mcast).
+.El
+.Sh ADDRESS FORMAT
+Addresses are specified using the syntax
+.Ar proto!addr!port .
+.Pp
+Currently, the only supported protocol is
+.Cm udp .
+.Pp
+Alternatively, you can specify a file descriptor number instead.
+Note that OSC relies on write boundaries being preserved, so this
+file descriptor should refer to some open message-oriented socket.
+.Sh MDNS / DNS-SD
+When started with
+.Fl z ,
+.Nm
+registers itself as an
+.Cm _osc._udp
+service via mDNS.
+The service instance name has the form
+.Qq oscmix @ Ar uid
+where
+.Ar uid
+is the device UID including serial number (e.g.\&
+.Qq Fireface 802 (12345678) ) .
+.Pp
+The following TXT record keys are published:
+.Bl -tag -width recvport
+.It id
+Short device identifier (e.g.\&
+.Cm ff802 ) .
+.It uid
+Full device UID with serial number.
+.It flags
+Device capability bitmask (DEVICE_HAS_DUREC=1, DEVICE_HAS_ROOMEQ=2).
+.It inputs
+Number of input channels.
+.It outputs
+Number of output channels.
+.It recvport
+UDP port clients should send OSC commands to.
+.It sendport
+UDP port
+.Nm
+sends updates from.
+.It mcast
+1 if
+.Nm
+is sending to a multicast address, 0 otherwise.
+.El
+.Sh SUPPORTED DEVICES
+The following RME Fireface devices are supported when running in
+class-compliant mode:
+.Bl -bullet -compact
+.It
+RME Fireface 802
+.It
+RME Fireface UCX
+.It
+RME Fireface UCX II
+.It
+RME Fireface UFX
+.It
+RME Fireface UFX II
+.It
+RME Fireface UFX III
+.It
+RME Fireface UFX+
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width MIDIPORT
+.It Ev MIDIPORT
+MIDI port name to connect to.
+Set automatically by
+.Xr alsarawio 1
+and
+.Xr alsaseqio 1 .
+Overridden by
+.Fl p .
+.El
+.Sh EXAMPLES
+Start
+.Nm
+on Linux using alsaseqio with a Fireface UFX III:
+.Pp
+.Dl alsaseqio 16:3 oscmix
+.Pp
+Start
+.Nm
+on Linux using alsarawio:
+.Pp
+.Dl alsarawio 0,0,3 oscmix
+.Pp
+Start with multicast output on a custom port and mDNS registration:
+.Pp
+.Dl alsaseqio 16:3 oscmix -m 8233 -z
+.Pp
+Start
+.Nm
+on macOS using coremidiio:
+.Pp
+.Dl coremidiio -f 6,7 -p 2 oscmix
+.Pp
+Start on macOS with multicast and mDNS:
+.Pp
+.Dl coremidiio -f 6,7 -p 2 oscmix -m -z
+.Pp
+Accept OSC from any interface and send to a specific remote host:
+.Pp
+.Dl alsaseqio 16:0 oscmix -r udp!0.0.0.0!7222 -s udp!192.168.1.100!8222
+.Sh SEE ALSO
+.Xr alsarawio 1 ,
+.Xr alsaseqio 1 ,
+.Xr coremidiio 1

@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1a1f2e"/>
+      <stop offset="100%" stop-color="#0d1117"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00d4ff"/>
+      <stop offset="100%" stop-color="#0088cc"/>
+    </linearGradient>
+    <linearGradient id="fader1" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2a3040"/>
+      <stop offset="100%" stop-color="#1a2030"/>
+    </linearGradient>
+    <linearGradient id="knob" x1="30%" y1="20%" x2="70%" y2="80%">
+      <stop offset="0%" stop-color="#3a4560"/>
+      <stop offset="100%" stop-color="#1e2535"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <filter id="softglow">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <clipPath id="roundClip">
+      <rect width="512" height="512" rx="96" ry="96"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
+
+  <!-- Subtle grid lines -->
+  <g opacity="0.06" stroke="#00d4ff" stroke-width="1">
+    <line x1="0" y1="128" x2="512" y2="128"/>
+    <line x1="0" y1="256" x2="512" y2="256"/>
+    <line x1="0" y1="384" x2="512" y2="384"/>
+    <line x1="128" y1="0" x2="128" y2="512"/>
+    <line x1="256" y1="0" x2="256" y2="512"/>
+    <line x1="384" y1="0" x2="384" y2="512"/>
+  </g>
+
+  <!-- VU meter bars - background tracks -->
+  <g opacity="0.15">
+    <rect x="68" y="80" width="18" height="240" rx="4" fill="#00d4ff"/>
+    <rect x="100" y="80" width="18" height="240" rx="4" fill="#00d4ff"/>
+    <rect x="132" y="80" width="18" height="240" rx="4" fill="#00d4ff"/>
+  </g>
+
+  <!-- VU meter bars - active (left channel) -->
+  <rect x="68" y="200" width="18" height="120" rx="4" fill="#00d4ff" opacity="0.9" filter="url(#glow)"/>
+  <rect x="100" y="160" width="18" height="160" rx="4" fill="#00d4ff" opacity="0.9" filter="url(#glow)"/>
+  <rect x="132" y="220" width="18" height="100" rx="4" fill="#00d4ff" opacity="0.9" filter="url(#glow)"/>
+
+  <!-- VU meter peak indicators -->
+  <rect x="68" y="190" width="18" height="4" rx="2" fill="#ffffff" opacity="0.8"/>
+  <rect x="100" y="150" width="18" height="4" rx="2" fill="#ffffff" opacity="0.8"/>
+  <rect x="132" y="210" width="18" height="4" rx="2" fill="#ffffff" opacity="0.8"/>
+
+  <!-- Fader channel 1 -->
+  <rect x="200" y="80" width="28" height="240" rx="6" fill="url(#fader1)" stroke="#2a3550" stroke-width="1.5"/>
+  <!-- Fader track line -->
+  <rect x="213" y="90" width="2" height="220" rx="1" fill="#0a0f1a"/>
+  <!-- Fader cap -->
+  <rect x="196" y="168" width="36" height="44" rx="5" fill="url(#knob)" stroke="#3a4560" stroke-width="1.5"/>
+  <rect x="196" y="187" width="36" height="2" rx="1" fill="#00d4ff" opacity="0.8"/>
+
+  <!-- Fader channel 2 -->
+  <rect x="248" y="80" width="28" height="240" rx="6" fill="url(#fader1)" stroke="#2a3550" stroke-width="1.5"/>
+  <rect x="261" y="90" width="2" height="220" rx="1" fill="#0a0f1a"/>
+  <!-- Fader cap higher position -->
+  <rect x="244" y="128" width="36" height="44" rx="5" fill="url(#knob)" stroke="#3a4560" stroke-width="1.5"/>
+  <rect x="244" y="147" width="36" height="2" rx="1" fill="#00d4ff" opacity="0.8"/>
+
+  <!-- Fader channel 3 -->
+  <rect x="296" y="80" width="28" height="240" rx="6" fill="url(#fader1)" stroke="#2a3550" stroke-width="1.5"/>
+  <rect x="309" y="90" width="2" height="220" rx="1" fill="#0a0f1a"/>
+  <!-- Fader cap -->
+  <rect x="292" y="208" width="36" height="44" rx="5" fill="url(#knob)" stroke="#3a4560" stroke-width="1.5"/>
+  <rect x="292" y="227" width="36" height="2" rx="1" fill="#00d4ff" opacity="0.8"/>
+
+  <!-- Rotary knobs row -->
+  <!-- Knob 1 -->
+  <circle cx="116" cy="360" r="28" fill="url(#knob)" stroke="#2a3550" stroke-width="2"/>
+  <circle cx="116" cy="360" r="20" fill="#131820" stroke="#1e2535" stroke-width="1"/>
+  <circle cx="116" cy="360" r="4" fill="#00d4ff" opacity="0.9"/>
+  <!-- Knob indicator line -->
+  <line x1="116" y1="356" x2="116" y2="344" stroke="#00d4ff" stroke-width="2.5" stroke-linecap="round" opacity="0.9"/>
+
+  <!-- Knob 2 -->
+  <circle cx="186" cy="360" r="28" fill="url(#knob)" stroke="#2a3550" stroke-width="2"/>
+  <circle cx="186" cy="360" r="20" fill="#131820" stroke="#1e2535" stroke-width="1"/>
+  <circle cx="186" cy="360" r="4" fill="#00d4ff" opacity="0.9"/>
+  <line x1="190" y1="352" x2="198" y2="343" stroke="#00d4ff" stroke-width="2.5" stroke-linecap="round" opacity="0.9" transform="rotate(35, 186, 360)"/>
+
+  <!-- Knob 3 -->
+  <circle cx="256" cy="360" r="28" fill="url(#knob)" stroke="#2a3550" stroke-width="2"/>
+  <circle cx="256" cy="360" r="20" fill="#131820" stroke="#1e2535" stroke-width="1"/>
+  <circle cx="256" cy="360" r="4" fill="#00d4ff" opacity="0.9"/>
+  <line x1="256" y1="356" x2="262" y2="345" stroke="#00d4ff" stroke-width="2.5" stroke-linecap="round" opacity="0.9" transform="rotate(-20, 256, 360)"/>
+
+  <!-- Knob 4 -->
+  <circle cx="326" cy="360" r="28" fill="url(#knob)" stroke="#2a3550" stroke-width="2"/>
+  <circle cx="326" cy="360" r="20" fill="#131820" stroke="#1e2535" stroke-width="1"/>
+  <circle cx="326" cy="360" r="4" fill="#00d4ff" opacity="0.9"/>
+  <line x1="326" y1="356" x2="326" y2="344" stroke="#00d4ff" stroke-width="2.5" stroke-linecap="round" opacity="0.9" transform="rotate(50, 326, 360)"/>
+
+  <!-- OSC waveform / signal indicator on the right -->
+  <g filter="url(#softglow)" opacity="0.85">
+    <polyline
+      points="362,180 374,140 382,220 390,130 398,200 406,160 414,195 422,155 430,185 442,175"
+      fill="none"
+      stroke="#00d4ff"
+      stroke-width="3"
+      stroke-linecap="round"
+      stroke-linejoin="round"/>
+  </g>
+  <!-- Signal line label area -->
+  <rect x="358" y="240" width="88" height="3" rx="1.5" fill="#00d4ff" opacity="0.3"/>
+
+  <!-- Bottom label bar -->
+  <rect x="60" y="430" width="392" height="2" rx="1" fill="#00d4ff" opacity="0.2"/>
+
+  <!-- "OSC" text -->
+  <text x="256" y="475" font-family="'Courier New', monospace" font-size="28" font-weight="700"
+        fill="#00d4ff" text-anchor="middle" letter-spacing="6" opacity="0.9">oscmix</text>
+
+  <!-- Corner accent marks -->
+  <g stroke="#00d4ff" stroke-width="2" opacity="0.4" fill="none">
+    <path d="M 48 72 L 48 48 L 72 48"/>
+    <path d="M 440 48 L 464 48 L 464 72"/>
+    <path d="M 48 440 L 48 464 L 72 464"/>
+    <path d="M 440 464 L 464 464 L 464 440"/>
+  </g>
+</svg>

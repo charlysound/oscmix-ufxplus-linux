@@ -1,0 +1,74 @@
+name: Bug report
+description: Report a reproducible oscmix or UFX+ GTK4 problem.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reduce monitoring levels before reproducing hardware-control problems.
+        Do not include device serial numbers, credentials or other private data.
+  - type: input
+    id: version
+    attributes:
+      label: oscmix commit or version
+      placeholder: e.g. output of git rev-parse --short HEAD
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Interface and firmware
+      placeholder: e.g. Fireface UFX+, firmware version
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Linux distribution and kernel
+      placeholder: e.g. Linux Mint 22, kernel 6.x
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection mode
+      options:
+        - USB Class Compliant mode
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest repeatable sequence.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety and privacy
+      options:
+        - label: I reproduced this at a safe monitoring level.
+          required: true
+        - label: I removed serial numbers, credentials and private information.
+          required: true

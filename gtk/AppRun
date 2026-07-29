@@ -1,0 +1,298 @@
+#!/bin/bash
+
+# Dual-mode launcher: works both as AppImage AppRun and as system-installed binary.
+#
+# AppImage mode:  $APPIMAGE is set by the AppImage runtime, binaries live
+#                 relative to this script inside the mounted squashfs.
+# System mode:    installed to /usr/bin/oscmix-launcher, binaries are in /usr/bin,
+#                 resources in /usr/share/oscmix.
+#
+# Multi-instance: each launch gets its own dconf profile + temp db so GSettings
+#                 are isolated per instance. Ports are auto-suggested and user-editable.
+
+if [ -n "$APPIMAGE" ]; then
+    # Running inside an AppImage - resolve root from script location
+    APPDIR="$(dirname "$(readlink -f "$0")")"
+    BIN_DIR="$APPDIR/usr/bin"
+    SHARE_DIR="$APPDIR/usr/share/oscmix"
+else
+    # Running as system-installed binary
+    BIN_DIR="/usr/bin"
+    SHARE_DIR="/usr/share/oscmix"
+fi
+
+OSCMIX="$BIN_DIR/oscmix"
+ALSARAWIO="$BIN_DIR/alsarawio"
+ALSASEQIO="$BIN_DIR/alsaseqio"
+GTK="$BIN_DIR/oscmix-gtk"
+
+export GSETTINGS_SCHEMA_DIR="$SHARE_DIR"
+
+# Supported device name patterns (matched against amidi/aconnect output)
+SUPPORTED_DEVICES=(
+    "Fireface 802"
+    "Fireface UCX"
+    "Fireface UCX II"
+    "Fireface UFX+"
+    "Fireface UFX"
+    "Fireface UFX II"
+    "Fireface UFX III"
+)
+
+# Base OSC ports - each additional instance offsets by 1
+OSC_BASE_RECV=7222
+OSC_BASE_SEND=8222
+
+IO_PID=""
+OSCMIX_PID=""
+DCONF_TMP_DIR=""
+
+# - Cleanup on exit
+cleanup() {
+    if [ -n "$OSCMIX_PID" ] && kill -0 "$OSCMIX_PID" 2>/dev/null; then
+        kill "$OSCMIX_PID"
+    fi
+    if [ -n "$IO_PID" ] && kill -0 "$IO_PID" 2>/dev/null; then
+        kill "$IO_PID"
+    fi
+    # Remove temp dconf profile and db for this instance
+    [ -n "$DCONF_TMP_DIR" ] && rm -rf "$DCONF_TMP_DIR"
+}
+trap cleanup EXIT
+
+# - Find next free OSC recv port by inspecting cmdlines of running oscmix instances
+find_free_ports() {
+    local recv=$OSC_BASE_RECV
+    local send=$OSC_BASE_SEND
+    local used=()
+
+    for pid in $(pgrep -x oscmix 2>/dev/null); do
+        local port
+        port=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+            | grep -A1 '\-r' | grep 'udp!' | grep -oE '[0-9]+$')
+        [ -n "$port" ] && used+=("$port")
+    done
+
+    while printf '%s\n' "${used[@]}" | grep -qx "$recv"; do
+        recv=$((recv + 1))
+        send=$((send + 1))
+    done
+
+    echo "$recv $send"
+}
+
+# - Set up an isolated dconf profile + keyfile db for this instance
+# This lets multiple GTK instances have independent GSettings (ports etc.)
+setup_dconf_profile() {
+    local recv=$1
+    local send=$2
+
+    DCONF_TMP_DIR=$(mktemp -d /tmp/oscmix-dconf-XXXXXX)
+
+    # Keyfile backend db with our port values pre-populated
+    local keyfile_dir="$DCONF_TMP_DIR/db/oscmix-instance.d"
+    mkdir -p "$keyfile_dir"
+    cat > "$keyfile_dir/instance.ini" <<EOF
+[/oscmix/]
+send-host='127.0.0.1'
+send-port=uint32 $recv
+recv-host='127.0.0.1'
+recv-port=uint32 $send
+EOF
+
+    # dconf profile: keyfile backend first (our values), then user db as fallback
+    local profile="$DCONF_TMP_DIR/profile"
+    cat > "$profile" <<EOF
+user-db:$DCONF_TMP_DIR/db/oscmix-instance
+system-db:local
+EOF
+
+    export DCONF_PROFILE="$profile"
+}
+
+# - Determine io mode (alsarawio or alsaseqio)
+IO_MODE=$(zenity --list \
+    --title="oscmix – MIDI Backend" \
+    --text="Select the MIDI backend to use:" \
+    --radiolist \
+    --column="" --column="Backend" --column="Description" \
+    TRUE "alsaseqio" "ALSA Sequencer API (recommended)" \
+    FALSE "alsarawio" "ALSA Raw MIDI" \
+    --width=420 --height=250 2>/dev/null)
+
+[ $? -ne 0 ] && exit 0  # User cancelled
+
+# - Scan for supported devices
+declare -a DEVICE_LIST=()
+
+if [ "$IO_MODE" = "alsarawio" ]; then
+    # Parse amidi -l output, find supported devices and their last port.
+    # Strip hw: prefix - alsarawio expects plain card,dev,sub format (e.g. 0,0,1)
+    while IFS= read -r line; do
+        for dev in "${SUPPORTED_DEVICES[@]}"; do
+            if echo "$line" | grep -q "$dev"; then
+                RAW_PORT=$(echo "$line" | awk '{print $2}')
+                PORT=$(echo "$RAW_PORT" | sed 's/^hw://')
+                NAME=$(echo "$line" | sed 's/.*hw:[0-9,]* *//')
+                DEVICE_LIST+=("$PORT|$NAME")
+            fi
+        done
+    done < <(amidi -l 2>/dev/null | grep -v "^Dir")
+
+    # Keep only last port per device (highest subdevice for same card)
+    declare -A LAST_PORT
+    for entry in "${DEVICE_LIST[@]}"; do
+        PORT="${entry%%|*}"
+        NAME="${entry##*|}"
+        CARD=$(echo "$PORT" | cut -d, -f1)
+        LAST_PORT["$CARD"]="$entry"
+    done
+    DEVICE_LIST=()
+    for entry in "${LAST_PORT[@]}"; do
+        DEVICE_LIST+=("$entry")
+    done
+
+else
+    # Parse aconnect -l output, find supported devices and their last port
+    CURRENT_CLIENT=""
+    CURRENT_NAME=""
+    LAST_PORTNUM=""
+    while IFS= read -r line; do
+        if echo "$line" | grep -q "^client"; then
+            if [ -n "$CURRENT_CLIENT" ] && [ -n "$LAST_PORTNUM" ]; then
+                DEVICE_LIST+=("${CURRENT_CLIENT}:${LAST_PORTNUM}|${CURRENT_NAME}")
+            fi
+            CURRENT_CLIENT=""
+            CURRENT_NAME=""
+            LAST_PORTNUM=""
+            for dev in "${SUPPORTED_DEVICES[@]}"; do
+                if echo "$line" | grep -q "$dev"; then
+                    CURRENT_CLIENT=$(echo "$line" | grep -o 'client [0-9]*' | awk '{print $2}')
+                    CURRENT_NAME=$(echo "$line" | sed "s/client [0-9]*: '//;s/' .*//")
+                    break
+                fi
+            done
+        elif [ -n "$CURRENT_CLIENT" ] && echo "$line" | grep -qE "^ +[0-9]+ '"; then
+            LAST_PORTNUM=$(echo "$line" | grep -o '^ *[0-9]*' | tr -d ' ')
+        fi
+    done < <(aconnect -l 2>/dev/null)
+    if [ -n "$CURRENT_CLIENT" ] && [ -n "$LAST_PORTNUM" ]; then
+        DEVICE_LIST+=("${CURRENT_CLIENT}:${LAST_PORTNUM}|${CURRENT_NAME}")
+    fi
+fi
+
+# - Handle no device found
+if [ ${#DEVICE_LIST[@]} -eq 0 ]; then
+    zenity --question \
+        --title="oscmix – No Device Found" \
+        --text="No supported RME device was detected.\n\nDo you want to start the UI anyway (without a connected unit)?" \
+        --ok-label="Start anyway" \
+        --cancel-label="Quit" \
+        --width=380 2>/dev/null
+    if [ $? -ne 0 ]; then
+        exit 0
+    fi
+    read -r SUGGESTED_RECV SUGGESTED_SEND <<< "$(find_free_ports)"
+    setup_dconf_profile "$SUGGESTED_RECV" "$SUGGESTED_SEND"
+    exec "$GTK"
+fi
+
+# - Let user select device if multiple found
+if [ ${#DEVICE_LIST[@]} -eq 1 ]; then
+    SELECTED="${DEVICE_LIST[0]}"
+else
+    ZENITY_ARGS=()
+    for entry in "${DEVICE_LIST[@]}"; do
+        PORT="${entry%%|*}"
+        NAME="${entry##*|}"
+        ZENITY_ARGS+=("$PORT" "$NAME")
+    done
+
+    SELECTED_PORT=$(zenity --list \
+        --title="oscmix – Select Device" \
+        --text="Multiple supported devices found.\nSelect the device to use:" \
+        --column="Port" --column="Device" \
+        "${ZENITY_ARGS[@]}" \
+        --width=500 --height=300 2>/dev/null)
+
+    [ $? -ne 0 ] && exit 0
+
+    for entry in "${DEVICE_LIST[@]}"; do
+        if [ "${entry%%|*}" = "$SELECTED_PORT" ]; then
+            SELECTED="$entry"
+            break
+        fi
+    done
+fi
+
+DEVICE_PORT="${SELECTED%%|*}"
+DEVICE_NAME="${SELECTED##*|}"
+
+# - Determine suggested ports and let user confirm/edit them
+read -r SUGGESTED_RECV SUGGESTED_SEND <<< "$(find_free_ports)"
+
+RUNNING_COUNT=$(pgrep -x oscmix 2>/dev/null | wc -l | tr -d ' ')
+if [ "$RUNNING_COUNT" -gt 0 ]; then
+    PORT_TEXT="oscmix already running ($RUNNING_COUNT instance(s)) – next free ports pre-filled.\nEdit if needed, or leave as-is.\n\nDevice: $DEVICE_NAME"
+else
+    PORT_TEXT="OSC ports for this instance.\nEdit if needed, or leave as-is.\n\nDevice: $DEVICE_NAME"
+fi
+
+# Show port dialog with suggested values pre-filled as placeholder text.
+# User can clear and retype, or just hit OK to accept suggestions.
+PORT_INPUT=$(zenity --forms \
+    --title="oscmix – OSC Ports" \
+    --text="$PORT_TEXT" \
+    --add-entry="Recv port  [suggested: $SUGGESTED_RECV]" \
+    --add-entry="Send port  [suggested: $SUGGESTED_SEND]" \
+    --separator="|" \
+    2>/dev/null)
+
+[ $? -ne 0 ] && exit 0
+
+OSC_RECV="${PORT_INPUT%%|*}"
+OSC_SEND="${PORT_INPUT##*|}"
+
+# Strip whitespace
+OSC_RECV=$(echo "$OSC_RECV" | tr -d ' ')
+OSC_SEND=$(echo "$OSC_SEND" | tr -d ' ')
+
+# Fall back to suggested ports if user left fields empty
+[ -z "$OSC_RECV" ] && OSC_RECV="$SUGGESTED_RECV"
+[ -z "$OSC_SEND" ] && OSC_SEND="$SUGGESTED_SEND"
+
+# - Set up isolated dconf profile so this GTK instance uses its own ports
+setup_dconf_profile "$OSC_RECV" "$OSC_SEND"
+
+# - Launch oscmix via selected backend with explicit OSC ports
+if [ "$IO_MODE" = "alsarawio" ]; then
+    # alsarawio usage: alsarawio card,dev,sub cmd [arg...]
+    "$ALSARAWIO" "$DEVICE_PORT" \
+        "$OSCMIX" -r "udp!127.0.0.1!${OSC_RECV}" -s "udp!127.0.0.1!${OSC_SEND}" &
+    IO_PID=$!
+else
+    # alsaseqio usage: alsaseqio client:port cmd [arg...]
+    "$ALSASEQIO" "$DEVICE_PORT" \
+        "$OSCMIX" -r "udp!127.0.0.1!${OSC_RECV}" -s "udp!127.0.0.1!${OSC_SEND}" &
+    IO_PID=$!
+fi
+
+# Give oscmix a moment to initialize
+sleep 2.0
+
+# Verify our oscmix instance started by checking if it listens on the expected
+# recv port. This is reliable even when other instances are already running.
+if ! ss -ulnp 2>/dev/null | grep -q ":${OSC_RECV} "; then
+    zenity --error \
+        --title="oscmix – Launch Failed" \
+        --text="Failed to start oscmix with device:\n$DEVICE_NAME ($DEVICE_PORT)\n\nPlease check that the device is connected and not in use." \
+        --width=380 2>/dev/null
+    exit 1
+fi
+
+# Track the oscmix PID listening on our recv port for cleanup
+OSCMIX_PID=$(ss -ulnp 2>/dev/null | grep ":${OSC_RECV} " \
+    | grep -oP 'pid=\K[0-9]+' | head -1)
+
+# - Launch GTK UI (blocking - cleanup runs on exit via trap)
+"$GTK"

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=oscmix GTK4 – UFX+ Prototype
+GenericName=Fireface Mixer
+Comment=Lightweight professional mixer for RME Fireface UFX+
+Exec=@APPDIR@/AppRun
+Icon=@APPDIR@/oscmix.svg
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=RME;Fireface;UFX;TotalMix;OSC;Mixer;
+StartupNotify=true

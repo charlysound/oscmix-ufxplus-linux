@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/charlysound/oscmix-ufxplus-linux/security
+    about: Report vulnerabilities privately; do not open a public issue.
+  - name: Upstream oscmix
+    url: https://github.com/huddx01/oscmix
+    about: Check upstream for questions unrelated to the UFX+ GTK4 adaptation.

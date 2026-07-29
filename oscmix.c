@@ -1,0 +1,2699 @@
+#define _XOPEN_SOURCE 700  /* for memccpy */
+#include <assert.h>
+#include <limits.h>
+#include <math.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>  /* for strcasecmp */
+#ifndef __wasi__
+#include <unistd.h>
+#endif
+#include "device.h"
+#include "intpack.h"
+#include "oscmix.h"
+#include "osc.h"
+#include "sysex.h"
+#include "util.h"
+
+#define LEN(a) (sizeof (a) / sizeof *(a))
+#define PI 3.14159265358979323846
+
+struct context {
+	const struct node *node;
+	const char *pattern;
+	char *addr, *addrpos, *addrend;
+	struct param param;
+	bool exact;
+	int reg;  /* actual register number (for name handling) */
+};
+
+struct node {
+	const char *name;
+	enum control ctl;
+	void (*set)(struct context *ctx, struct oscmsg *msg);
+	void (*new)(struct context *ctx, int val);
+	union {
+		struct {
+			const char *const *const names;
+			size_t nameslen;
+		};
+		struct {
+			short min;
+			short max;
+			float scale;
+		};
+	};
+	const struct node *tree;
+};
+
+struct input {
+	bool stereo;
+	bool mute;
+	bool hiz;
+	int width;
+	char name[12];
+};
+
+struct output {
+	bool stereo;
+	float *mix;
+	bool *solo;
+	bool solo_active;
+	char name[12];
+};
+
+struct durecfile {
+	short reg[6];
+	char name[9];
+	unsigned long samplerate;
+	unsigned channels;
+	unsigned length;
+};
+
+int dflag;
+static const struct device *device;
+static char deviceuid[256];  /* "Device Name (SERIALNO)" - derived once in init() */
+static struct input *inputs;
+static struct output *outputs;
+/* FX level buffers sized device->inputslen+2 / device->outputslen+2 at init */
+static uint_least32_t *inputpeakfx;
+static uint_least32_t *outputpeakfx;
+static uint_least64_t *inputrmsfx;
+static uint_least64_t *outputrmsfx;
+static struct {
+	int status;
+	int position;
+	int time;
+	int usberrors;
+	int usbload;
+	float totalspace;
+	float freespace;
+	struct durecfile *files;
+	size_t fileslen;
+	int file;
+	int recordtime;
+	int index;
+	int next;
+	int playmode;
+} durec = {.index = -1};
+static struct {
+	int vers;
+	int load;
+	int avail;
+	int status;
+} dsp = {.vers = -1, .load = -1, .avail = -1, .status = -1};
+
+static void oscsend(const char *addr, const char *type, ...);
+static void oscflush(void);
+static void oscsendenum(const char *addr, int val, const char *const names[], size_t nameslen);
+static void rewrite_solo_output(struct output *out);
+static void sync_source_solo_pair(int source_index);
+static void sync_output_solo_pair(int output_index);
+
+static void
+dump(const char *name, const void *ptr, size_t len)
+{
+	size_t i;
+	const unsigned char *buf;
+
+	buf = ptr;
+	if (name)
+		fputs(name, stdout);
+	if (len > 0) {
+		if (name)
+			putchar('\t');
+		printf("%.2x", buf[0]);
+	}
+	for (i = 1; i < len; ++i)
+		printf(" %.2x", buf[i]);
+	putchar('\n');
+}
+
+static void
+writesysex(int subid, const unsigned char *buf, size_t len, unsigned char *sysexbuf)
+{
+	struct sysex sysex;
+	size_t sysexlen;
+
+	sysex.mfrid = 0x200d;
+	sysex.devid = 0x10;
+	sysex.data = NULL;
+	sysex.datalen = len * 5 / 4;
+	sysex.subid = subid;
+	sysexlen = sysexenc(&sysex, sysexbuf, SYSEX_MFRID | SYSEX_DEVID | SYSEX_SUBID);
+	base128enc(sysex.data, buf, len);
+	writemidi(sysexbuf, sysexlen);
+}
+
+static int
+setreg(unsigned reg, unsigned val)
+{
+	unsigned long regval;
+	unsigned char buf[4], sysexbuf[7 + 5];
+	unsigned par;
+
+	val &= 0xffff;
+	if (dflag >= 3 && (reg != 0x3f00 || dflag >= 4))
+		fprintf(stderr, "[DEBUG L%d] setreg [%.4X]=%.4X\n", dflag, reg, val);
+	regval = (reg & 0x7fff) << 16 | val;
+	par = regval >> 16 ^ regval;
+	par ^= par >> 8;
+	par ^= par >> 4;
+	par ^= par >> 2;
+	par ^= par >> 1;
+	regval |= (~par & 1) << 31;
+	putle32(buf, regval);
+
+	writesysex(0, buf, sizeof buf, sysexbuf);
+	return 0;
+}
+
+static void
+setval(struct context *ctx, int val)
+{
+	int reg;
+	reg = device->ctltoreg(ctx->node->ctl, &ctx->param);
+	if (dflag >= 2)
+		fprintf(stderr, "[DEBUG L%d] setval: reg=0x%04X val=0x%04X\n", dflag, reg, val);
+	if (reg != -1)
+		setreg(reg, val);
+}
+
+static void
+setint(struct context *ctx, struct oscmsg *msg)
+{
+	int_least32_t val;
+
+	val = oscgetint(msg);
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, val);
+}
+
+static void
+newint(struct context *ctx, int val)
+{
+	oscsend(ctx->addr, ",i", val);
+}
+
+static void
+setfixed(struct context *ctx, struct oscmsg *msg)
+{
+	float val;
+
+	val = oscgetfloat(msg);
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, lroundf(val / ctx->node->scale));
+}
+
+static void
+newfixed(struct context *ctx, int val)
+{
+	oscsend(ctx->addr, ",f", val * ctx->node->scale);
+}
+
+static void
+setenum(struct context *ctx, struct oscmsg *msg)
+{
+	const char *str;
+	int val;
+
+	switch (*msg->type) {
+		case 's':
+			str = oscgetstr(msg);
+			if (str) {
+				for (val = 0; val < ctx->node->nameslen; ++val) {
+					if (strcasecmp(str, ctx->node->names[val]) == 0)
+						break;
+				}
+				if (val == ctx->node->nameslen)
+					return;
+			}
+			break;
+		default:
+			val = oscgetint(msg);
+			break;
+	}
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, val);
+}
+
+static void
+newenum(struct context *ctx, int val)
+{
+	oscsendenum(ctx->addr, val, ctx->node->names, ctx->node->nameslen);
+}
+
+static void
+setbool(struct context *ctx, struct oscmsg *msg)
+{
+	bool val;
+
+	if (!ctx->exact)
+		return;
+	val = oscgetint(msg);
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, val);
+}
+
+static void
+newbool(struct context *ctx, int val)
+{
+	if (ctx->exact)
+		oscsend(ctx->addr, ",i", val != 0);
+}
+
+
+
+
+static void
+setmixlevel(const struct input *in, const struct output *out, float level)
+{
+	int reg;
+	long val;
+	struct param p;
+
+	p.in = in - inputs;
+	p.out = out - outputs;
+	if (in->mute || (out->solo_active && !out->solo[p.in]))
+		level = 0.f;
+	reg = device->ctltoreg(MIX_LEVEL, &p);
+	if (reg == -1)
+		return;
+
+	if (device->flags & DEVICE_MIXER_V2) {
+		/* UFX* mixer format:
+		 * bits[0-13]: 14-bit signed 1/10 dB (0 = 0 dB, negative = attenuation, -3000 = mute)
+		 * bit[14]:    parameter (0 = volume)
+		 * bit[15]:    channel  (0 = left/odd output, 1 = right/even output) */
+		int val_bits, channel_bit;
+		float db;
+
+		channel_bit = (p.out % 2) ? 0x8000 : 0x0000;
+
+		if (level <= 0.0f) {
+			val_bits = (-3000) & 0x3FFF;  /* mute sentinel: -300.0 dB in 14-bit signed */
+			db = -300.0f;
+		} else {
+			db = 20.0f * log10f(level);
+			val_bits = (int)lroundf(db * 10.0f) & 0x3FFF;  /* signed: 0 at 0 dB, negative for attenuation */
+		}
+
+		val = channel_bit | val_bits;
+
+		if (dflag >= 3)
+			fprintf(stderr, "[DEBUG L%d] setmixlevel [V2] in=%d out=%d reg=0x%04X ch=%s db=%.1f val_bits=0x%03X full=0x%04lX\n" ,dflag, p.in, p.out, reg, channel_bit ? "R" : "L", db, val_bits, val);
+	} else {
+		/* UCX II / FF802 format: signed linear amplitude */
+		val = lroundf(level * 0x8000);
+		assert(val >= 0);
+		assert(val <= 0x10000);
+		if (val > 0x4000)
+			val = (val >> 3) - 0x8000;
+
+		if (dflag >= 3)
+			fprintf(stderr, "[DEBUG L%d] setmixlevel [V1] in=%d out=%d reg=0x%X val=0x%lX (level=%.3f)\n", dflag, p.in, p.out, reg, val, level);
+	}
+
+	setreg(reg, val);
+}
+
+static void
+setmixpan(const struct input *in, const struct output *out, int pan)
+{
+	int reg;
+	long val;
+	struct param p;
+
+	if (!(device->flags & DEVICE_MIXER_V2))
+		return;
+
+	p.in = in - inputs;
+	p.out = out - outputs;
+	reg = device->ctltoreg(MIX_LEVEL, &p);
+	if (reg == -1)
+		return;
+
+	/* pan register: bit14=1 (parameter=pan), bits[7:0] = pan as 8-bit two's complement
+	 * R100=100=0x64, center=0, L100=-100=0x9C */
+	val = 0x4000 | (pan & 0xFF);
+
+	if (dflag >= 3)
+		fprintf(stderr, "[DEBUG L%d] setmixpan [V2] in=%d out=%d reg=0x%04X pan=%d val=0x%04lX\n", dflag, p.in, p.out, reg, pan, val);
+
+	setreg(reg, val);
+}
+
+static void
+setchannel(struct context *ctx, struct oscmsg *msg)
+{
+	char *end;
+	long index;
+
+	index = strtol(ctx->pattern + 1, &end, 10);
+	if (*end != '/' || index < 1)
+		return;
+	--index;
+	if (strcmp(ctx->node->name, "input") == 0) {
+		if (index >= device->inputslen + device->outputslen)
+			return;
+		ctx->param.in = index;
+	} else if (strcmp(ctx->node->name, "playback") == 0) {
+		if (index >= device->outputslen)
+			return;
+		ctx->param.in = device->inputslen + index;
+	} else if (strcmp(ctx->node->name, "output") == 0) {
+		if (index >= device->outputslen)
+			return;
+		ctx->param.out = index;
+	} else {
+		assert(0);
+		return;
+	}
+	ctx->pattern = end;
+}
+
+static void
+newchannel(struct context *ctx, int val)
+{
+	const char *type;
+	int ret, chan;
+
+	if (ctx->param.in != -1) {
+		type = "input";
+		chan = ctx->param.in;
+	} else {
+		type = "output";
+		chan = ctx->param.out;
+	}
+	ret = snprintf(ctx->addr, ctx->addrend - ctx->addr, "/%s/%d", type, chan + 1);
+	if (ret >= 0)
+		ctx->addrpos = ctx->addr + ret;
+}
+
+static void
+muteinput(struct input *in, bool mute)
+{
+	const struct output *out;
+	const float *mix;
+
+	if (in->mute == mute)
+		return;
+	if (in->stereo && (in - inputs) & 1)
+		--in;
+	in[0].mute = mute;
+	if (in->stereo)
+		in[1].mute = mute;
+	for (out = outputs; out != outputs + device->outputslen; ++out) {
+		mix = &out->mix[in - inputs];
+		if (!in->stereo && (device->flags & DEVICE_MIXER_V2) && out->stereo) {
+			/* V2 mono-in stereo-out: restore full volume (not pre-panned) to both L/R.
+			 * Snap to L output to get both ll and lr from the stereo pair cache. */
+			const struct output *out_l = out - ((out - outputs) & 1);
+			float ll = out_l[0].mix[in - inputs];
+			float lr = out_l[1].mix[in - inputs];
+			float full_vol = sqrtf(ll * ll + lr * lr);
+			setmixlevel(in, out, mute ? 0.f : full_vol);
+		} else {
+			if (mix[0] > 0)
+				setmixlevel(in, out, mute ? 0 : mix[0]);
+			if (in->stereo && mix[1] > 0)
+				setmixlevel(in + 1, out, mute ? 0 : mix[1]);
+		}
+	}
+}
+
+static void
+setinputmute(struct context *ctx, struct oscmsg *msg)
+{
+	struct input *in;
+	bool val;
+
+	val = oscgetint(msg);
+	if (oscend(msg) != 0)
+		return;
+	assert((unsigned)ctx->param.in < device->inputslen + device->outputslen);
+	in = &inputs[ctx->param.in];
+	setval(ctx, val);
+	muteinput(in, val);
+}
+
+static void
+newinputmute(struct context *ctx, int val)
+{
+	struct input *in;
+
+	assert((unsigned)ctx->param.in < device->inputslen);
+	in = &inputs[ctx->param.in];
+	muteinput(in, val);
+	newbool(ctx, val);
+}
+
+static void
+setinputstereo(struct context *ctx, struct oscmsg *msg)
+{
+	struct input *in;
+	bool val;
+	int idx_left;
+
+	val = oscgetint(msg);
+	if (oscend(msg) != 0)
+		return;
+	idx_left = ctx->param.in & ~1;
+	in = &inputs[idx_left];
+	in[0].stereo = in[1].stereo = val;
+	if (val)
+		sync_source_solo_pair(idx_left);
+	setval(ctx, val);
+	ctx->param.in ^= 1;
+	setval(ctx, val);
+
+	/*
+	 * Playback channels share the inputs[] array (indexed by
+	 * device->inputslen + i) but have NO underlying device register --
+	 * setval is a no-op for them. The device therefore never echoes a
+	 * /playback/N/stereo update, which means the right-channel CSS rule
+	 *   .channel-outer.channel-right:has(.stereo:checked)
+	 * never fires and the right strip stays glued to the left when
+	 * un-pairing. Emit the OSC update for both partners explicitly so
+	 * the web UI can split / merge the strip pair.
+	 */
+	if (idx_left >= device->inputslen) {
+		char addr[64];
+		int pb_left = idx_left - device->inputslen;
+		snprintf(addr, sizeof addr, "/playback/%d/stereo", pb_left + 1);
+		oscsend(addr, ",i", val != 0);
+		snprintf(addr, sizeof addr, "/playback/%d/stereo", pb_left + 2);
+		oscsend(addr, ",i", val != 0);
+	}
+}
+
+static void
+newinputstereo(struct context *ctx, int val)
+{
+	struct input *in;
+
+	assert((unsigned)ctx->param.in < device->inputslen);
+	in = &inputs[ctx->param.in & ~1];
+	in[0].stereo = val;
+	in[1].stereo = val;
+	if (val)
+		sync_source_solo_pair(in - inputs);
+	snprintf(ctx->addr, ctx->addrend - ctx->addr, "/input/%d/stereo", (int)(in - inputs) + 1);
+	oscsend(ctx->addr, ",i", val != 0);
+	snprintf(ctx->addr, ctx->addrend - ctx->addr, "/input/%d/stereo", (int)(in - inputs) + 2);
+	oscsend(ctx->addr, ",i", val != 0);
+}
+
+static void
+newoutputstereo(struct context *ctx, int val)
+{
+	struct output *out;
+
+	assert((unsigned)ctx->param.out < device->outputslen);
+	out = &outputs[ctx->param.out & ~1];
+	out[0].stereo = val;
+	out[1].stereo = val;
+	if (val)
+		sync_output_solo_pair(out - outputs);
+	snprintf(ctx->addr, ctx->addrend - ctx->addr, "/output/%d/stereo", (int)(out - outputs + 1));
+	oscsend(ctx->addr, ",i", val != 0);
+	snprintf(ctx->addr, ctx->addrend - ctx->addr, "/output/%d/stereo", (int)(out - outputs + 2));
+	oscsend(ctx->addr, ",i", val != 0);
+}
+
+static void
+setname(struct context *ctx, struct oscmsg *msg)
+{
+	const char *name;
+	char namebuf[12];
+	int i, reg, val;
+
+	/* No-args = read request: respond at the same address with the
+	 * cached name (populated as the device pushes NAME registers). */
+	if (msg->type && *msg->type == '\0') {
+		const char *cached = NULL;
+		if (ctx->param.in != -1 && ctx->param.in < device->inputslen + device->outputslen)
+			cached = inputs[ctx->param.in].name;
+		else if (ctx->param.out != -1 && ctx->param.out < device->outputslen)
+			cached = outputs[ctx->param.out].name;
+		if (cached && ctx->addr)
+			oscsend(ctx->addr, ",s", cached);
+		return;
+	}
+
+	name = oscgetstr(msg);
+	if (oscend(msg) != 0)
+		return;
+	reg = device->ctltoreg(ctx->node->ctl, &ctx->param);
+	if (reg == -1)
+		return;
+	strncpy(namebuf, name, sizeof namebuf - 1);
+	namebuf[sizeof namebuf - 1] = '\0';
+	for (i = 0; i < sizeof namebuf; i += 2, ++reg) {
+		val = getle16(namebuf + i);
+		setreg(reg, val);
+	}
+}
+
+static void
+newname(struct context *ctx, int val)
+{
+	char *namebuf;
+	int basereg, off;
+
+	/* Get pointer to the correct name buffer based on input/output */
+	if (ctx->param.in != -1) {
+		if (ctx->param.in >= device->inputslen + device->outputslen)
+			return;
+		namebuf = inputs[ctx->param.in].name;
+	} else if (ctx->param.out != -1) {
+		if (ctx->param.out >= device->outputslen)
+			return;
+		namebuf = outputs[ctx->param.out].name;
+	} else {
+		return;
+	}
+
+	/*
+	 * Get the base register for this channel's name
+	 * ctltoreg returns the FIRST register of the name block
+	 * For ffufxiii: 0x2800 + (channel_idx * 8)
+	 */
+	basereg = device->ctltoreg(NAME, &ctx->param);
+	if (basereg == -1)
+		return;
+
+	/*
+	 * Calculate byte offset within the name (0, 2, 4, 6, 8, or 10)
+	 * ctx->reg contains the actual register that triggered this call
+	 * Each register holds 2 bytes, so offset = (register_offset * 2)
+	 */
+	off = (ctx->reg - basereg) * 2;
+
+	/* Validate offset (should be 0-10 for 6 registers = 12 bytes) */
+	if (off < 0 || off > 10) {
+		if (dflag >= 2)
+			fprintf(stderr, "[DEBUG L%d] newname: invalid offset %d (reg=0x%X, basereg=0x%X)\n", dflag, off, ctx->reg, basereg);
+		return;
+	}
+
+	/* Update the 2 bytes at this position */
+	putle16(namebuf + off, val);
+
+	/* If this is the last register (offset 10), send the complete name */
+	if (off == 10) {
+		namebuf[11] = '\0';  /* Ensure null termination */
+		oscsend(ctx->addr, ",s", namebuf);
+	}
+}
+
+static void
+getinputgainrange(int index, short *min, short *max)
+{
+	const struct channelinfo *info;
+
+	assert((unsigned)index < device->inputslen);
+	info = &device->inputs[index];
+	*min = info->gain.min;
+	*max = info->gain.max;
+	if (inputs[index].hiz && info->gain.instrument_max > 0) {
+		*min = info->gain.instrument_min;
+		*max = info->gain.instrument_max;
+	}
+}
+
+static void
+sendinputgainrange(int index)
+{
+	char addr[64];
+	short min, max;
+
+	getinputgainrange(index, &min, &max);
+	snprintf(addr, sizeof addr, "/input/%d/gainrange", index + 1);
+	oscsend(addr, ",ii", (int)min, (int)max);
+}
+
+static void
+setinputgain(struct context *ctx, struct oscmsg *msg)
+{
+	float val;
+	short min, max;
+
+	val = oscgetfloat(msg);
+	if (oscend(msg) != 0)
+		return;
+	assert((unsigned)ctx->param.in < device->inputslen);
+	if (device->inputs[ctx->param.in].flags & INPUT_HAS_GAIN) {
+		getinputgainrange(ctx->param.in, &min, &max);
+		/* UFX II/UFX+ microphone gain is 0 dB or 8..75 dB. */
+		if (min == 0 && device->inputs[ctx->param.in].gain.instrument_max > 0 &&
+		    val > 0 && val < device->inputs[ctx->param.in].gain.instrument_min)
+			return;
+		if (val < min)
+			val = min;
+		if (val > max)
+			val = max;
+		setval(ctx, val * 10);
+	}
+}
+
+static void
+newinputgain(struct context *ctx, int val)
+{
+	oscsend(ctx->addr, ",f", val / 10.0);
+}
+
+static void
+newinputhiz(struct context *ctx, int val)
+{
+	assert((unsigned)ctx->param.in < device->inputslen);
+	inputs[ctx->param.in].hiz = val != 0;
+	newbool(ctx, val);
+	if (device->inputs[ctx->param.in].flags & INPUT_HAS_GAIN)
+		sendinputgainrange(ctx->param.in);
+}
+
+static void
+newinputreflevel(struct context *ctx, int val)
+{
+	const struct channelinfo *info;
+
+	assert((unsigned)ctx->param.in < device->inputslen);
+	info = &device->inputs[ctx->param.in];
+	oscsendenum(ctx->addr, val & 0xf, info->reflevel.names, info->reflevel.nameslen);
+}
+
+static void
+setoutputloopback(struct context *ctx, struct oscmsg *msg)
+{
+	bool val;
+	unsigned char buf[4], sysexbuf[7 + 5];
+
+	val = oscgetint(msg);
+	if (dflag >= 2)
+		fprintf(stderr, "[DEBUG L%d] setoutputloopback: val = %d, param.in = %d\n", dflag, val, ctx->param.in);
+	if (oscend(msg) != 0)
+		return;
+	putle32(buf, val << 7 | ctx->param.in);
+	writesysex(3, buf, sizeof buf, sysexbuf);
+}
+
+static void
+seteqdrecord(struct context *ctx, struct oscmsg *msg)
+{
+	bool val;
+	unsigned char buf[4], sysexbuf[7 + 5];
+
+	val = oscgetint(msg);
+	if (oscend(msg) != 0)
+		return;
+	putle32(buf, val);
+	writesysex(4, buf, sizeof buf, sysexbuf);
+}
+
+static void
+newdspload(struct context *ctx, int val)
+{
+	if (dsp.load != (val & 0xff)) {
+		dsp.load = val & 0xff;
+		oscsend("/hardware/dspload", ",i", dsp.load);
+	}
+	if (dsp.vers != val >> 8) {
+		dsp.vers = val >> 8;
+		oscsend("/hardware/dspvers", ",i", dsp.vers);
+	}
+}
+
+/*
+ * DSP function avail register layout (per RME docs):
+ *   bits[0..1]  low cut    (slot 1, slot 2)
+ *   bits[2..3]  eq         (slot 1, slot 2)
+ *   bits[4..5]  dynamics   (slot 1, slot 2)
+ *   bits[6..7]  autolevel  (slot 1, slot 2)
+ *   bits[8..9]  record     (slot 1, slot 2)
+ *   bits[10..15] unused
+ * Each function gets a 0..2 count = number of active slots.
+ */
+static void
+newdspavail(struct context *ctx, int val)
+{
+	int lowcut, eq, dyn, al, rec;
+
+	(void)ctx;
+	if (val == dsp.avail)
+		return;
+	dsp.avail = val;
+	lowcut = (val & 1) + ((val >> 1) & 1);
+	eq     = ((val >> 2) & 1) + ((val >> 3) & 1);
+	dyn    = ((val >> 4) & 1) + ((val >> 5) & 1);
+	al     = ((val >> 6) & 1) + ((val >> 7) & 1);
+	rec    = ((val >> 8) & 1) + ((val >> 9) & 1);
+	oscsend("/hardware/dspavail", ",iiiii", lowcut, eq, dyn, al, rec);
+}
+
+/*
+ * DSP function overload status register (per RME docs):
+ *   bit 0  play       (1=ok, 0=overload)
+ *   bit 1  low cut
+ *   bit 2  eq
+ *   bit 3  dynamics
+ *   bit 4  autolevel
+ *   bit 5  record
+ *   bit 6  delay
+ *   bit 7  room eq
+ *   bits[8..15] channel number (1-based)
+ * Sent as a single OSC message with 8 booleans + channel.
+ */
+static void
+newdspstatus(struct context *ctx, int val)
+{
+	int s, chan;
+
+	(void)ctx;
+	if (val == dsp.status)
+		return;
+	dsp.status = val;
+	s = val & 0xff;
+	chan = (val >> 8) & 0xff;
+	oscsend("/hardware/dspstatus", ",iiiiiiiii",
+		!!(s & 0x01), !!(s & 0x02), !!(s & 0x04), !!(s & 0x08),
+		!!(s & 0x10), !!(s & 0x20), !!(s & 0x40), !!(s & 0x80),
+		chan);
+}
+
+static void
+newdim(struct context *ctx, int val)
+{
+	oscsend(ctx->addr, ",i", val < 0 ? 0 : val);
+}
+
+static void
+newarcdelta(struct context *ctx, int val)
+{
+	oscsend("/hardware/arcdelta", ",i", val );
+}
+
+static void
+newarcbuttons(struct context *ctx, int val)
+{
+	oscsend("/hardware/arcbuttons", ",i", val );
+}
+
+static void
+setdb(const struct output *out, const struct input *in, float db)
+{
+	int reg, val;
+	struct param p;
+
+	p.in = in - inputs;
+	p.out = out - outputs;
+	reg = device->ctltoreg(MIX, &p);
+	if (reg == -1)
+		return;
+	val = (isinf(db) && db < 0 ? -650 : lroundf(db * 10.f)) & 0x7fff;
+	setreg(reg, val);
+}
+
+
+
+
+static void
+setpan(const struct output *out, const struct input *in, int pan)
+{
+	int reg, val;
+	struct param p;
+
+	p.in = in - inputs;
+	p.out = out - outputs;
+	reg = device->ctltoreg(MIX, &p);
+	if (reg == -1) {
+		if (dflag >= 2)
+			fprintf(stderr, "[DEBUG L%d] setpan: in=%d out=%d pan=%d -> no MIX reg\n",
+					dflag, p.in, p.out, pan);
+		return;
+	}
+	val = (pan & 0x7fff) | 0x8000;
+
+	if (dflag >= 2)
+		fprintf(stderr, "[DEBUG L%d] setpan: in=%d out=%d reg=0x%04X pan=%d val=0x%04X\n",
+				dflag, p.in, p.out, reg, pan, (unsigned)val & 0xffff);
+
+	setreg(reg, val);
+}
+
+struct level {
+	float vol;  /* 0 (mute) to 1 (0dB) */
+	short pan;  /* -100 (left) to 100 (right) */
+	short width;  /* -100 (reversed) to 100 (full stereo) */
+};
+
+static void
+calclevel(const struct output *out, const struct input *in, bool instereo, struct level *l)
+{
+	int ich;
+	float ll, lr, rl, rr, w;
+
+	if (instereo)
+		instereo = in->stereo;
+	if (instereo && (in - inputs) & 1)
+		--in;
+	if (out->stereo && (out - outputs) & 1)
+		--out;
+	ich = in - inputs;
+	if (out->stereo) {
+		ll = out[0].mix[ich];
+		lr = out[1].mix[ich];
+		if (instereo) {
+			rl = out[0].mix[ich + 1];
+			rr = out[1].mix[ich + 1];
+			w = ll + rl == 0 ? 1 : 2 * ll / (ll + rl) - 1;
+			if (ll < rr) {  /* p > 0 */
+				l->vol = 2 * rr / (1 + w);
+				l->pan = lroundf(100 * (1 - ll / rr));
+			} else {
+				l->vol = 2 * ll / (1 + w);
+				l->pan = ll == 0 ? 0 : lroundf(100 * (rr / ll - 1));
+			}
+			l->width = lroundf(100 * w);
+		} else {
+			l->vol = sqrtf(ll * ll + lr * lr);
+			l->pan = l->vol > 0.f ? lroundf(acosf(ll / l->vol) * 400.f / PI - 100.f) : 0;
+		}
+	} else {
+		ll = out[0].mix[ich];
+		if (instereo) {
+			rl = out[0].mix[ich + 1];
+			if (ll < rl) {  /* p > 0 */
+				l->vol = 2 * rl;
+				l->pan = lroundf(100 * (1 - ll / rl));
+			} else {
+				l->vol = 2 * ll;
+				l->pan = ll == 0 ? 0 : lroundf(100 * (rl / ll - 1));
+			}
+		} else {
+			l->vol = ll;
+			l->pan = 0;
+		}
+	}
+}
+
+static void
+setlevel(struct output *out, const struct input *in, bool instereo, const struct level *l)
+{
+	float w, theta;
+	float ll, lr, rl, rr;
+	float *mix[2];
+
+	if (instereo)
+		instereo = in->stereo;
+	if (instereo && (in - inputs) & 1)
+		--in;
+	if (out->stereo && (out - outputs) & 1)
+		--out;
+	mix[0] = &out[0].mix[in - inputs];
+	if (out->stereo) {
+		mix[1] = &out[1].mix[in - inputs];
+		if (instereo) {
+			w = l->width / 100.f;
+			if (l->pan > 0) {
+				ll = (100 - l->pan) * (1 + w) / 200.f * l->vol;
+				lr = (1 - w) / 2.f * l->vol;
+				rl = (100 - l->pan) * (1 - w) / 200.f * l->vol;
+				rr = (1 + w) / 2.f * l->vol;
+			} else {
+				ll = (1 + w) / 2.f * l->vol;
+				lr = (100 + l->pan) * (1 - w) / 200.f * l->vol;
+				rl = (1 - w) / 2.f * l->vol;
+				rr = (100 + l->pan) * (1 + w) / 200.f * l->vol;
+			}
+			mix[0][1] = rl;
+			mix[1][1] = rr;
+			if (!in->mute) {
+				setmixlevel(in + 1, out, rl);
+				setmixlevel(in + 1, out + 1, rr);
+			}
+		} else {
+			theta = (l->pan + 100) * PI / 400.f;
+			ll = cosf(theta) * l->vol;
+			lr = sinf(theta) * l->vol;
+		}
+		mix[0][0] = ll;
+		mix[1][0] = lr;
+		if (!instereo && (device->flags & DEVICE_MIXER_V2)) {
+			/* V2 mono-in stereo-out: write full volume to both L/R, pan via hardware register.
+			 * Cache still holds cosine-panned ll/lr so calclevel can reconstruct vol/pan. */
+			if (!in->mute) {
+				setmixlevel(in, out, l->vol);
+				setmixlevel(in, out + 1, l->vol);
+			}
+			setmixpan(in, out, l->pan);
+		} else {
+			if (!in->mute) {
+				setmixlevel(in, out, ll);
+				setmixlevel(in, out + 1, lr);
+			}
+		}
+	} else {
+		if (instereo) {
+			if (l->pan > 0) {
+				ll = (100 - l->pan) / 200.f * l->vol;
+				rl = l->vol / 2;
+			} else {
+				ll = l->vol / 2;
+				rl = (100 + l->pan) / 200.f * l->vol;
+			}
+			mix[0][1] = rl;
+			if (!in->mute)
+				setmixlevel(in + 1, out, rl);
+		} else {
+			ll = l->vol;
+		}
+		mix[0][0] = ll;
+		if (!in->mute)
+			setmixlevel(in, out, ll);
+	}
+}
+
+static void
+setmix(struct context *ctx, struct oscmsg *msg)
+{
+	unsigned long i;
+	char *end;
+	float vol;
+	struct level level;
+	struct output *out;
+	struct input *in;
+	int base;
+
+	i = strtoul(ctx->pattern + 1, &end, 10) - 1;
+	if (*end != '/' || i >= device->outputslen)
+		return;
+	ctx->param.out = i;
+	ctx->pattern = end;
+	out = &outputs[i];
+
+	if (oscmatch(ctx->pattern, "input", &end))
+		base = 0;
+	else if (oscmatch(ctx->pattern, "playback", &end))
+		base = device->inputslen;
+	else
+		return;
+	i = strtoul(end + 1, &end, 10) - 1;
+	if (*end || i >= device->inputslen + device->outputslen - base)
+		return;
+	i += base;
+	ctx->param.in = i;
+	ctx->pattern = end;
+	in = &inputs[i];
+
+	if (out->stereo && (out - outputs) & 1)
+		--out;
+	if (in->stereo && (in - inputs) & 1)
+		--in;
+
+	calclevel(out, in, 1, &level);
+	level.width = in->width;
+	if (*msg->type == 'N') {
+		++msg->type;
+	} else {
+		vol = oscgetfloat(msg);
+		level.vol = vol <= -65.f ? 0 : powf(10.f, vol / 20.f);
+	}
+
+	if (*msg->type) {
+		level.pan = oscgetint(msg);
+		if (level.pan < -100)
+			level.pan = -100;
+		else if (level.pan > 100)
+			level.pan = 100;
+	}
+	if (oscend(msg) != 0)
+		return;
+	if (dflag >= 1)
+		fprintf(stderr, "[DEBUG L%d] setmix: out=%lu(%s) in=%lu(%s) vol=%.1fdB pan=%d width=%d\n",
+				dflag, (unsigned long)(out - outputs) + 1, out->name,
+				(unsigned long)(in - inputs) + 1, in->name,
+				level.vol > 0 ? 20.f * log10f(level.vol) : -INFINITY,
+				level.pan, level.width);
+	setlevel(out, in, 1, &level);
+	calclevel(out, in, 0, &level);
+	setdb(out, in, 20.f * log10f(level.vol));
+	setpan(out, in, level.pan);
+	if (in->stereo) {
+		calclevel(out, in + 1, 0, &level);
+		setdb(out, in + 1, 20.f * log10f(level.vol));
+		setpan(out, in + 1, level.pan);
+	}
+}
+
+static void
+rewrite_solo_output(struct output *out)
+{
+	int i, sources;
+
+	sources = device->inputslen + device->outputslen;
+	out->solo_active = false;
+	for (i = 0; i < sources; ++i) {
+		if (out->solo[i]) {
+			out->solo_active = true;
+			break;
+		}
+	}
+	for (i = 0; i < sources; ++i)
+		setmixlevel(&inputs[i], out, out->mix[i]);
+}
+
+static void
+apply_solo_range(struct output *out, int first, int last, bool enabled)
+{
+	bool changed, was_active;
+	int i, sources;
+
+	sources = device->inputslen + device->outputslen;
+	if (first < 0 || first > last || last >= sources)
+		return;
+	was_active = out->solo_active;
+	changed = false;
+	for (i = first; i <= last; ++i) {
+		if (out->solo[i] != enabled)
+			changed = true;
+		out->solo[i] = enabled;
+	}
+	if (!changed)
+		return;
+	out->solo_active = false;
+	for (i = 0; i < sources; ++i) {
+		if (out->solo[i]) {
+			out->solo_active = true;
+			break;
+		}
+	}
+	/* Entering or leaving Solo changes every non-solo route.  Adding or
+	 * removing another source while Solo remains active changes only that
+	 * source, avoiding a full 188-route SysEx burst on every click. */
+	if (was_active != out->solo_active) {
+		for (i = 0; i < sources; ++i)
+			setmixlevel(&inputs[i], out, out->mix[i]);
+	} else {
+		for (i = first; i <= last; ++i)
+			setmixlevel(&inputs[i], out, out->mix[i]);
+	}
+}
+
+/*
+ * Pairing two strips must also merge their per-submix Solo state.  TotalMix
+ * exposes the pair as one strip, so an already-soloed right member must not
+ * silently disappear when the pair is created.  OR preserves either member's
+ * active Solo and mirrors it to both channels.
+ */
+static void
+sync_source_solo_pair(int source_index)
+{
+	bool enabled, changed;
+	int i, left, sources;
+
+	sources = device->inputslen + device->outputslen;
+	left = source_index & ~1;
+	if (left < 0 || left + 1 >= sources)
+		return;
+	for (i = 0; i < device->outputslen; ++i) {
+		enabled = outputs[i].solo[left] || outputs[i].solo[left + 1];
+		changed = outputs[i].solo[left] != enabled ||
+		          outputs[i].solo[left + 1] != enabled;
+		if (changed)
+			apply_solo_range(&outputs[i], left, left + 1, enabled);
+	}
+}
+
+static void
+sync_output_solo_pair(int output_index)
+{
+	bool enabled, changed;
+	int i, left, sources;
+
+	sources = device->inputslen + device->outputslen;
+	left = output_index & ~1;
+	if (left < 0 || left + 1 >= device->outputslen)
+		return;
+	changed = false;
+	for (i = 0; i < sources; ++i) {
+		enabled = outputs[left].solo[i] || outputs[left + 1].solo[i];
+		if (outputs[left].solo[i] != enabled ||
+		    outputs[left + 1].solo[i] != enabled)
+			changed = true;
+		outputs[left].solo[i] = enabled;
+		outputs[left + 1].solo[i] = enabled;
+	}
+	if (changed) {
+		rewrite_solo_output(&outputs[left]);
+		rewrite_solo_output(&outputs[left + 1]);
+	}
+}
+
+/*
+ * TotalMix-style solo-in-place. Solo state belongs to one hardware-output
+ * submix and never changes the cached fader values of another submix.
+ * Address: /solo/<output>/<input|playback>/<channel> ,i 0|1
+ */
+static void
+setsolo(struct context *ctx, struct oscmsg *msg)
+{
+	char type[16], tail;
+	char addr[80];
+	const char *pattern;
+	bool enabled;
+	int out_index, source_index, base, source_limit;
+	int out_first, out_last, source_first, source_last;
+	int i, j, sources;
+
+	pattern = ctx->pattern;
+	if (strcmp(pattern, "/clear") == 0) {
+		if (oscend(msg) != 0)
+			return;
+		sources = device->inputslen + device->outputslen;
+		for (i = 0; i < device->outputslen; ++i) {
+			if (!outputs[i].solo_active)
+				continue;
+			memset(outputs[i].solo, 0, (size_t)sources * sizeof *outputs[i].solo);
+			rewrite_solo_output(&outputs[i]);
+		}
+		oscsend("/solo/clear", ",");
+		return;
+	}
+	if (sscanf(pattern, "/%d/%15[^/]/%d%c", &out_index, type,
+	           &source_index, &tail) != 3)
+		return;
+	if (out_index < 1 || out_index > device->outputslen || source_index < 1)
+		return;
+	if (strcmp(type, "input") == 0) {
+		base = 0;
+		source_limit = device->inputslen;
+	} else if (strcmp(type, "playback") == 0) {
+		base = device->inputslen;
+		source_limit = device->outputslen;
+	} else {
+		return;
+	}
+	if (source_index > source_limit)
+		return;
+	enabled = oscgetint(msg) != 0;
+	if (oscend(msg) != 0)
+		return;
+	--out_index;
+	source_index = base + source_index - 1;
+	out_first = outputs[out_index].stereo ? out_index & ~1 : out_index;
+	out_last = outputs[out_first].stereo && out_first + 1 < device->outputslen
+	           ? out_first + 1 : out_first;
+	source_first = inputs[source_index].stereo ? source_index & ~1 : source_index;
+	source_last = inputs[source_first].stereo &&
+	              source_first + 1 < device->inputslen + device->outputslen
+	              ? source_first + 1 : source_first;
+	for (i = out_first; i <= out_last; ++i) {
+		apply_solo_range(&outputs[i], source_first, source_last, enabled);
+	}
+	for (i = out_first; i <= out_last; ++i) {
+		for (j = source_first; j <= source_last; ++j) {
+			const char *source_type = j < device->inputslen ? "input" : "playback";
+			int visible_index = j < device->inputslen ? j + 1 : j - device->inputslen + 1;
+			(void)snprintf(addr, sizeof addr, "/solo/%d/%s/%d",
+			               i + 1, source_type, visible_index);
+			oscsend(addr, ",i", enabled);
+		}
+	}
+}
+
+static void
+sendmix(struct context *ctx, struct output *out, struct input *in,
+        const struct level *level)
+{
+	const char *source_type;
+	int source_index;
+
+	source_index = (int)(in - inputs);
+	if (source_index < device->inputslen) {
+		source_type = "input";
+	} else {
+		source_type = "playback";
+		source_index -= device->inputslen;
+	}
+	snprintf(ctx->addr, ctx->addrend - ctx->addr, "/mix/%d/%s/%d",
+	         (int)(out - outputs) + 1, source_type, source_index + 1);
+	oscsend(ctx->addr, ",fi",
+	        level->vol > 0 ? 20.f * log10f(level->vol) : -INFINITY,
+	        level->pan);
+}
+
+static void
+newmix(struct context *ctx, int val)
+{
+	struct output *out;
+	struct input *in;
+	bool ispan;
+	struct level level;
+	int sources;
+
+	sources = device->inputslen + device->outputslen;
+	if (ctx->param.out < 0 || ctx->param.out >= device->outputslen ||
+	    ctx->param.in < 0 || ctx->param.in >= sources)
+		return;
+	in = &inputs[ctx->param.in];
+	out = &outputs[ctx->param.out];
+	/* Solo writes an effective mute value to non-solo sources. Ignore that
+	 * hardware echo so the cached post-fader level remains available for
+	 * an exact restore when Solo is released. */
+	if (out->solo_active && !out->solo[in - inputs])
+		return;
+
+	/*
+	 * Volume-only MIX echo path (FF802-class first-generation devices).
+	 *
+	 * The MIX register region (0x1EE0 + out*0x100 + in) is a read-only
+	 * echo of the per-input contribution to that output's mix. Format
+	 * differs from V2 devices:
+	 *
+	 *   bits[0..3]   reserved / unused
+	 *   bits[4..15]  signed 12-bit 1/10 dB
+	 *
+	 * There is no per-input pan slot -- pan is implemented by writing
+	 * different MIX_LEVEL values to the L and R outputs of a stereo
+	 * pair (see setlevel). Each side echoes its own MIX register with
+	 * its own volume value, so we update the cache slot for whichever
+	 * output the echo arrived on, then re-emit the combined view.
+	 *
+	 * No write back to the device here -- that would create a feedback
+	 * loop, since our setmix already wrote MIX_LEVEL when the user
+	 * moved the fader.
+	 */
+	if (device->flags & DEVICE_MIX_VOLONLY) {
+		int raw, v12, ich;
+		float vol;
+
+		raw = val & 0xFFFF;
+		v12 = (raw >> 4) & 0xFFF;
+		if (v12 & 0x800)
+			v12 -= 0x1000;
+		ich = ctx->param.in;
+		vol = v12 <= -650 ? 0.f : powf(10.f, v12 / 200.f);
+		if (vol > 2.f)
+			vol = 2.f;
+		out->mix[ich] = vol;
+
+		/*
+		 * Emit /mix/<out>/<input|playback>/<source> for every echoed
+		 * output, including the right side of a stereo pair. The web client
+		 * lets users click on either half of a paired output to view its submix --
+		 * if we suppressed right-side emissions, that view would stay
+		 * empty after a fresh /refresh and after un-pairing. For stereo
+		 * pairs calclevel snaps to the left and the two emissions carry
+		 * the same vol/pan, which is harmless (the second just overwrites
+		 * the first in the web cache).
+		 */
+		if (in->stereo && (in - inputs) & 1)
+			--in;
+
+		calclevel(out, in, 1, &level);
+		if (dflag >= 1)
+			fprintf(stderr, "[DEBUG L%d] newmix [VOLONLY]: out=%d(%s) in=%d(%s) raw=0x%04X dB10=%d -> vol=%.1fdB pan=%d\n",
+					dflag, (int)(out - outputs) + 1, out->name,
+					(int)(in - inputs) + 1, in->name, raw, v12,
+					level.vol > 0 ? 20.f * log10f(level.vol) : -INFINITY,
+					level.pan);
+		sendmix(ctx, out, in, &level);
+		return;
+	}
+
+	if ((out - outputs) & 1 && out->stereo)
+		return;
+	ispan = val & 0x8000;
+	val = ((val & 0x7fff) ^ 0x4000) - 0x4000;
+	calclevel(out, in, 0, &level);
+	if (ispan) {
+		if (val < -100)
+			val = -100;
+		if (val > 100)
+			val = 100;
+		level.pan = val;
+	} else {
+		level.vol = val <= -650 ? 0 : powf(10.f, val / 200.f);
+		if (level.vol > 2)
+			level.vol = 2;
+	}
+	if (dflag >= 1)
+		fprintf(stderr, "[DEBUG L%d] newmix: out=%d(%s) in=%d(%s) %s=%d -> vol=%.1fdB pan=%d\n",
+				dflag, ctx->param.out + 1, out->name,
+				ctx->param.in + 1, in->name,
+				ispan ? "pan" : "vol", val,
+				level.vol > 0 ? 20.f * log10f(level.vol) : -INFINITY,
+				level.pan);
+	setlevel(out, in, 0, &level);
+	if (in->stereo) {
+		if ((in - inputs) & 1)
+			--in;
+		calclevel(out, in, 1, &level);
+		in->width = level.width;
+	}
+	sendmix(ctx, out, in, &level);
+}
+
+static long
+getsamplerate(int val)
+{
+	static const long samplerate[] = {
+		32000,
+		44100,
+		48000,
+		64000,
+		88200,
+		96000,
+		128000,
+		176400,
+		192000,
+	};
+	return val >= 0 && val < LEN(samplerate) ? samplerate[val] : 0;
+}
+
+static void
+newsamplerate(struct context *ctx, int val)
+{
+	long rate;
+
+	rate = getsamplerate(val);
+	if (rate != 0)
+		oscsend(ctx->addr, ",i", rate);
+}
+
+static void
+newmeter(struct context *ctx, int val)
+{
+	const char *type, *name;
+	int chan;
+
+	if (ctx->param.in != -1) {
+		type = "input";
+		chan = ctx->param.in;
+	} else {
+		type = "output";
+		chan = ctx->param.out;
+	}
+	name = ctx->node->ctl == AUTOLEVEL_METER ? "autolevel" : "dynamics";
+	snprintf(ctx->addr, ctx->addrend - ctx->addr, "/%s/%d/%s/meter", type, chan + 1, name);
+	oscsend(ctx->addr, ",i", val >> 8 & 0xFF);
+	snprintf(ctx->addr, ctx->addrend - ctx->addr, "/%s/%d/%s/meter", type, chan + 2, name);
+	oscsend(ctx->addr, ",i", val & 0xFF);
+}
+
+static void
+newdurecstatus(struct context *ctx, int val)
+{
+	static const char *const names[] = {
+		"No Media", "Filesystem Error", "Initializing", "Reinitializing",
+		[5] = "Stopped", "Recording",
+		[10] = "Playing", "Paused",
+	};
+	int status;
+	int position;
+
+	status = val & 0xF;
+	if (status != durec.status) {
+		durec.status = status;
+		oscsendenum("/durec/status", status, names, LEN(names));
+		if (dflag >= 3)
+			fprintf(stderr, "[DEBUG L%d] newdurecstatus: status=%d names=%s\n",
+					dflag, status, names[status]);
+	}
+	position = (val >> 8) * 100 / 65;
+	if (position != durec.position) {
+		durec.position = position;
+		oscsend("/durec/position", ",i", position);
+		if (dflag >= 3)
+			fprintf(stderr, "[DEBUG L%d] newdurecstatus: position=%d\n",
+					dflag, position);
+	}
+
+
+}
+
+static void
+newdurectime(struct context *ctx, int val)
+{
+	if (val != durec.time) {
+		durec.time = val;
+		oscsend("/durec/time", ",i", val);
+	}
+}
+
+static void
+newdurecusbstatus(struct context *ctx, int val)
+{
+	int usbload, usberrors;
+
+	usbload = val >> 8;
+	if (usbload != durec.usbload) {
+		durec.usbload = usbload;
+		oscsend("/durec/usbload", ",i", val >> 8);
+	}
+	usberrors = val & 0xff;
+	if (usberrors != durec.usberrors) {
+		durec.usberrors = usberrors;
+		oscsend("/durec/usberrors", ",i", val & 0xff);
+	}
+}
+
+static void
+newdurectotalspace(struct context *ctx, int val)
+{
+	float totalspace;
+
+	totalspace = val / 16.f;
+	if (totalspace != durec.totalspace) {
+		durec.totalspace = totalspace;
+		oscsend("/durec/totalspace", ",f", totalspace);
+	}
+}
+
+static void
+newdurecfreespace(struct context *ctx, int val)
+{
+	float freespace;
+
+	freespace = val / 16.f;
+	if (freespace != durec.freespace) {
+		durec.freespace = freespace;
+		oscsend("/durec/freespace", ",f", freespace);
+	}
+}
+
+static void
+resizedurecfiles(size_t len)
+{
+	if (len < 0 || len == durec.fileslen)
+		return;
+	durec.files = realloc(durec.files, len * sizeof *durec.files);
+	if (!durec.files)
+		fatal(NULL);  /* XXX: probably shouldn't exit */
+	if (len > durec.fileslen)
+		memset(durec.files + durec.fileslen, 0, (len - durec.fileslen) * sizeof *durec.files);
+	durec.fileslen = len;
+	if (durec.index >= durec.fileslen)
+		durec.index = -1;
+	oscsend("/durec/numfiles", ",i", len);
+}
+
+static void
+newdurecfileslen(struct context *ctx, int val)
+{
+	resizedurecfiles(val);
+}
+
+static void
+setdurecfile(struct context *ctx, struct oscmsg *msg)
+{
+	int val;
+
+	val = oscgetint(msg);
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, val | 0x8000);
+}
+
+static void
+newdurecfile(struct context *ctx, int val)
+{
+	if (val != durec.file) {
+		durec.file = val;
+		oscsend(ctx->addr, ",i", val);
+	}
+}
+
+static void
+newdurecnext(struct context *ctx, int val)
+{
+	static const char *const names[] = {
+		"Single", "UFX Single", "Continuous", "Single Next", "Repeat Single", "Repeat All",
+	};
+	int next, playmode;
+
+	next = ((val & 0xfff) ^ 0x800) - 0x800;
+	if (next != durec.next) {
+		durec.next = next;
+		oscsend("/durec/next", ",i", next);
+	}
+	playmode = val >> 12;
+	if (playmode != durec.playmode) {
+		durec.playmode = playmode;
+		oscsendenum("/durec/playmode", playmode, names, LEN(names));
+	}
+}
+
+static void
+newdurecrecordtime(struct context *ctx, int val)
+{
+	unsigned time;
+
+	time = (unsigned)val & 0xFFFF;
+	if (time != durec.recordtime) {
+		durec.recordtime = time;
+		oscsend("/durec/recordtime", ",i", time);
+	}
+}
+
+static void
+newdurecindex(struct context *ctx, int val)
+{
+	if (val + 1 > durec.fileslen)
+		resizedurecfiles(val + 1);
+	durec.index = val;
+}
+
+static void
+newdurecname(struct context *ctx, int val)
+{
+	struct durecfile *f;
+	char *pos, old[2];
+	int off;
+
+	if (durec.index == -1)
+		return;
+	assert(durec.index < durec.fileslen);
+	f = &durec.files[durec.index];
+	off = (ctx->node->ctl - DUREC_NAME0) * 2;
+	assert(off >= 0 && off < sizeof f->name);
+	pos = f->name + off;
+	memcpy(old, pos, sizeof old);
+	putle16(pos, val);
+	if (memcmp(old, pos, sizeof old) != 0)
+		oscsend("/durec/name", ",is", durec.index, f->name);
+}
+
+static void
+newdurecinfo(struct context *ctx, int val)
+{
+	struct durecfile *f;
+	unsigned long samplerate;
+	int channels;
+
+	if (durec.index == -1)
+		return;
+	f = &durec.files[durec.index];
+	samplerate = getsamplerate(val & 0xFF);
+	if (samplerate != f->samplerate) {
+		f->samplerate = samplerate;
+		oscsend("/durec/samplerate", ",ii", durec.index, samplerate);
+	}
+	channels = val >> 8;
+	if (channels != f->channels) {
+		f->channels = channels;
+		oscsend("/durec/channels", ",ii", durec.index, channels);
+	}
+}
+
+static void
+newdureclength(struct context *ctx, int val)
+{
+	struct durecfile *f;
+
+	if (durec.index == -1)
+		return;
+	f = &durec.files[durec.index];
+	if (val != f->length) {
+		f->length = val;
+		oscsend("/durec/length", ",ii", durec.index, val);
+	}
+}
+
+static void
+setdurecstop(struct context *ctx, struct oscmsg *msg)
+{
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, 0x8121);
+}
+
+static void
+setdurecstoprecord(struct context *ctx, struct oscmsg *msg)
+{
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, 0x8120);
+}
+
+static void
+setdurecplay(struct context *ctx, struct oscmsg *msg)
+{
+	if (dflag >= 3)
+		fprintf(stderr, "[DEBUG L%d] setdurecplay: ctx=%p msg=%p\n",
+				dflag, (void *)ctx, (void *)msg);
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, 0x8123);
+}
+
+static void
+setdurecrecord(struct context *ctx, struct oscmsg *msg)
+{
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, 0x8122);
+}
+
+static void
+setdurecdelete(struct context *ctx, struct oscmsg *msg)
+{
+	int val;
+
+	val = oscgetint(msg);
+	if (oscend(msg) != 0)
+		return;
+	setval(ctx, 0x8000 | val);
+}
+
+static void
+setsetupstore(struct context *ctx, struct oscmsg *msg)
+{
+	int val;
+
+	val = oscgetint(msg);
+	if (oscend(msg) != 0)
+		return;
+	if (val < 0 || val >= 6)
+		return;
+	setval(ctx, 0x0910 | val);
+}
+
+static void
+setsetuparcleds(struct context *ctx, struct oscmsg *msg)
+{
+	int val = oscgetint(msg);
+	if (oscend(msg) != 0) return;
+
+	setval(ctx, val);
+}
+
+/*
+ * Build a TotalMix-compatible device UID into buf.
+ *
+ * Format:  <DeviceNameWithoutSpaces><8-digit-serial>
+ * Example: "Fireface UFX+ (12345678) Port 1" -> "FirefaceUFX+12345678"
+ *
+ * The serial is taken from digits inside the first parenthesized group of
+ * the port string. If fewer than 8 digits are present, the serial is padded
+ * on the right with deterministic digits 1..9 derived from a djb2 hash of
+ * the full port string -- so the same port always yields the same UID
+ * (clients rely on this for per-device configuration). If more than 8
+ * digits are present, the last 8 are used.
+ */
+static void
+makedeviceuid(const char *port, char *buf, size_t bufsz)
+{
+	char namepart[64];
+	char digits[9];
+	char extracted[16];
+	size_t ni, ei, j;
+	const char *open, *close, *p;
+
+	ni = 0;
+	for (p = device->name; *p && ni < sizeof namepart - 1; ++p) {
+		if (*p != ' ')
+			namepart[ni++] = *p;
+	}
+	namepart[ni] = '\0';
+
+	ei = 0;
+	open = strchr(port, '(');
+	close = open ? strchr(open, ')') : NULL;
+	if (open && close) {
+		for (p = open + 1; p < close && ei < sizeof extracted - 1; ++p) {
+			if (*p >= '0' && *p <= '9')
+				extracted[ei++] = *p;
+		}
+	}
+
+	if (ei >= 8) {
+		memcpy(digits, extracted + ei - 8, 8);
+	} else {
+		uint32_t h;
+		memcpy(digits, extracted, ei);
+		h = 5381;
+		for (p = port; *p; ++p)
+			h = h * 33u ^ (unsigned char)*p;
+		for (j = ei; j < 8; ++j) {
+			digits[j] = '1' + (h % 9);
+			h = h * 2654435761u + 1u;
+		}
+	}
+	digits[8] = '\0';
+
+	snprintf(buf, bufsz, "%s%s", namepart, digits);
+}
+
+static void
+setdebug(struct context *ctx, struct oscmsg *msg)
+{
+	int dlvl;
+
+	(void)ctx;
+	dlvl = oscgetint(msg);
+	if (oscend(msg) != 0)
+		return;
+	if (dlvl < 0) dlvl = 0;
+	if (dlvl > DFLAG_MAX) dlvl = DFLAG_MAX;
+	dflag = dlvl;
+	fprintf(stderr, "[DEBUG] is now: [DEBUG L%d]\n", dflag);
+}
+
+static bool metering_enabled = true;
+
+static void
+setmetering(struct context *ctx, struct oscmsg *msg)
+{
+	int enabled;
+
+	(void)ctx;
+	enabled = oscgetint(msg);
+	if (oscend(msg) == 0)
+		metering_enabled = enabled != 0;
+}
+
+/*
+ * Build a comma-separated list of reflevel names into a temporary buffer and
+ * send it as a single OSC string at addr. No-op if the channel has no
+ * reflevel names. Used by the /device/channels response.
+ */
+static void
+sendreflevels(const char *addr, const struct channelinfo *ch)
+{
+	char buf[256];
+	size_t off = 0, j, slen;
+
+	if (ch->reflevel.nameslen == 0)
+		return;
+	for (j = 0; j < ch->reflevel.nameslen; ++j) {
+		slen = strlen(ch->reflevel.names[j]);
+		if (j > 0 && off < sizeof buf - 1)
+			buf[off++] = ',';
+		if (off + slen >= sizeof buf)
+			break;
+		memcpy(buf + off, ch->reflevel.names[j], slen);
+		off += slen;
+	}
+	buf[off] = '\0';
+	oscsend(addr, ",s", buf);
+}
+
+/*
+ * /device/info -- emit static device identity. Client should call this
+ * once after connect to discover what device it is talking to.
+ */
+static void
+setdeviceinfo(struct context *ctx, struct oscmsg *msg)
+{
+	(void)ctx; (void)msg;
+	oscsend("/device/id",      ",s", device->id);
+#ifndef __wasi__
+	/* A new process means a fresh device cache. Clients use this session value
+	 * to request a complete resynchronization after an automatic restart. */
+	oscsend("/device/session", ",i", (int)getpid());
+#endif
+	oscsend("/device/name",    ",s", device->name);
+	oscsend("/device/uid",     ",s", deviceuid);
+	oscsend("/device/flags",   ",i", device->flags);
+	oscsend("/device/inputs",  ",i", device->inputslen);
+	oscsend("/device/outputs", ",i", device->outputslen);
+	oscflush();
+}
+
+/*
+ * /device/channels -- emit per-channel capability info. Static; only needs
+ * to be requested once. Channels with no flags / no extra capabilities
+ * stay silent (saves bandwidth on devices with many trivial channels).
+ * Input and output blocks are flushed separately so the client can
+ * process them as they arrive.
+ */
+static void
+setdevicechannels(struct context *ctx, struct oscmsg *msg)
+{
+	char addr[64];
+	int i;
+	const struct channelinfo *ch;
+
+	(void)ctx; (void)msg;
+	for (i = 0; i < device->inputslen; ++i) {
+		ch = &device->inputs[i];
+		if (ch->flags) {
+			snprintf(addr, sizeof addr, "/input/%d/flags", i + 1);
+			oscsend(addr, ",i", ch->flags);
+		}
+		if (ch->flags & INPUT_HAS_GAIN) {
+			sendinputgainrange(i);
+		}
+		if (ch->flags & INPUT_HAS_REFLEVEL) {
+			snprintf(addr, sizeof addr, "/input/%d/reflevels", i + 1);
+			sendreflevels(addr, ch);
+		}
+	}
+	oscflush();
+	for (i = 0; i < device->outputslen; ++i) {
+		ch = &device->outputs[i];
+		if (ch->flags) {
+			snprintf(addr, sizeof addr, "/output/%d/flags", i + 1);
+			oscsend(addr, ",i", ch->flags);
+		}
+		if (ch->flags & OUTPUT_HAS_REFLEVEL) {
+			snprintf(addr, sizeof addr, "/output/%d/reflevels", i + 1);
+			sendreflevels(addr, ch);
+		}
+	}
+	oscflush();
+}
+
+/*
+ * /device/names -- bulk-emit cached channel names for inputs and outputs.
+ * Names that have not been received yet (empty cache) are skipped.
+ * Single-channel reads are also possible via /input/N/name and
+ * /output/N/name with no arguments (handled in setname).
+ */
+static void
+setdevicenames(struct context *ctx, struct oscmsg *msg)
+{
+	char addr[64];
+	int i;
+
+	(void)ctx; (void)msg;
+	for (i = 0; i < device->inputslen; ++i) {
+		if (inputs[i].name[0]) {
+			snprintf(addr, sizeof addr, "/input/%d/name", i + 1);
+			oscsend(addr, ",s", inputs[i].name);
+		}
+	}
+	oscflush();
+	for (i = 0; i < device->outputslen; ++i) {
+		if (outputs[i].name[0]) {
+			snprintf(addr, sizeof addr, "/output/%d/name", i + 1);
+			oscsend(addr, ",s", outputs[i].name);
+		}
+	}
+	oscflush();
+}
+
+/*
+ * /refresh -- request a full dump of the device's dynamic state. Static
+ * device/channel info is no longer sent here; clients should call
+ * /device/info, /device/channels and /device/names explicitly (typically
+ * once after connect). This keeps refresh cheap so clients can call it
+ * whenever they need to resync values.
+ */
+static void
+setrefresh(struct context *ctx, struct oscmsg *msg)
+{
+	struct input *pb;
+	char addr[64];
+	int i;
+
+	(void)msg;
+	dsp.vers = -1;
+	dsp.load = -1;
+	dsp.avail = -1;
+	dsp.status = -1;
+
+	setval(ctx, device->refresh);
+	for (i = 0; i < device->inputslen; ++i) {
+		if (device->inputs[i].flags & INPUT_HAS_GAIN)
+			sendinputgainrange(i);
+	}
+	for (i = 0; i < device->outputslen; ++i) {
+		pb = &inputs[device->inputslen + i];
+		snprintf(addr, sizeof addr, "/playback/%d/stereo", i + 1);
+		oscsend(addr, ",i", pb->stereo);
+	}
+	oscflush();
+}
+
+static const struct node lowcuttree[] = {
+	{"freq", LOWCUT_FREQ, .set=setint, .new=newint, .min=20, .max=500},
+	{"slope", LOWCUT_SLOPE, .set=setint, .new=newint},
+	{0},
+};
+
+static const struct node eqtree[] = {
+	{"band1freq", EQ_BAND1FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band1gain", EQ_BAND1GAIN, .set=setfixed, .new=newfixed, .scale=0.1, .min=-200, .max=200},
+	{"band1q", EQ_BAND1Q, .set=setfixed, .new=newfixed, .scale=0.1, .min=4, .max=99},
+	{"band1type", EQ_BAND1TYPE, .set=setenum, .new=newenum, .names=(const char *const[]){
+		"Peak", "Low Shelf", "High Pass", "Low Pass",
+	}, .nameslen=4},
+	{"band2freq", EQ_BAND2FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band2gain", EQ_BAND2GAIN, .set=setfixed, .new=newfixed, .scale=0.1, .min=-200, .max=200},
+	{"band2q", EQ_BAND2Q, .set=setfixed, .new=newfixed, .scale=0.1, .min=4, .max=99},
+	{"band3freq", EQ_BAND3FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band3gain", EQ_BAND3GAIN, .set=setfixed, .new=newfixed, .scale=0.1, .min=-200, .max=200},
+	{"band3q", EQ_BAND3Q, .set=setfixed, .new=newfixed, .scale=0.1, .min=4, .max=99},
+	{"band3type", EQ_BAND3TYPE, .set=setenum, .new=newenum, .names=(const char *const[]){
+		"Peak", "High Shelf", "Low Pass", "High Pass",
+	}, .nameslen=4},
+	{0},
+};
+
+static const struct node dynamicstree[] = {
+	{"gain", DYNAMICS_GAIN, .set=setfixed, .new=newfixed, .scale=0.1, .min=-300, .max=300},
+	{"attack", DYNAMICS_ATTACK, .set=setint, .new=newint, .min=0, .max=200},
+	{"release", DYNAMICS_RELEASE, .set=setint, .new=newint, .min=100, .max=999},
+	{"compthres", DYNAMICS_COMPTHRES, .set=setfixed, .new=newfixed, .scale=0.1, .min=-600, .max=0},
+	{"compratio", DYNAMICS_COMPRATIO, .set=setfixed, .new=newfixed, .scale=0.1, .min=10, .max=100},
+	{"expthres", DYNAMICS_EXPTHRES, .set=setfixed, .new=newfixed, .scale=0.1, .min=-990, .max=200},
+	{"expratio", DYNAMICS_EXPRATIO, .set=setfixed, .new=newfixed, .scale=0.1, .min=10, .max=100},
+	{NULL, DYNAMICS_METER, .new=newmeter},
+	{0},
+};
+
+static const struct node autoleveltree[] = {
+	{"maxgain", AUTOLEVEL_MAXGAIN, .set=setfixed, .new=newfixed, .scale=0.1, .min=0, .max=180},
+	{"headroom", AUTOLEVEL_HEADROOM, .set=setfixed, .new=newfixed, .scale=0.1, .min=30, .max=120},
+	{"risetime", AUTOLEVEL_RISETIME, .set=setfixed, .new=newfixed, .scale=0.1, .min=1, .max=99},
+	{NULL, AUTOLEVEL_METER, .new=newmeter},
+	{""},
+};
+
+static const struct node roomeqtree[] = {
+	{"delay", ROOMEQ_DELAY, .set=setfixed, .new=newfixed, .min=0, .max=425, .scale=0.001},
+	{"band1type", ROOMEQ_BAND1TYPE, .set=setenum, .new=newenum, .names=(const char *const[]){
+		"Peak", "Low Shelf", "High Pass", "Low Pass",
+	}, .nameslen=4},
+	{"band1gain", ROOMEQ_BAND1GAIN, .set=setfixed, .new=newfixed, .min=-200, .max=200, .scale=0.1},
+	{"band1freq", ROOMEQ_BAND1FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band1q", ROOMEQ_BAND1Q, .set=setfixed, .new=newfixed, .min=4, .max=99, .scale=0.1},
+	{"band2gain", ROOMEQ_BAND2GAIN, .set=setfixed, .new=newfixed, .min=-200, .max=200, .scale=0.1},
+	{"band2freq", ROOMEQ_BAND2FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band2q", ROOMEQ_BAND2Q, .set=setfixed, .new=newfixed, .min=4, .max=99, .scale=0.1},
+	{"band3gain", ROOMEQ_BAND3GAIN, .set=setfixed, .new=newfixed, .min=-200, .max=200, .scale=0.1},
+	{"band3freq", ROOMEQ_BAND3FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band3q", ROOMEQ_BAND3Q, .set=setfixed, .new=newfixed, .min=4, .max=99, .scale=0.1},
+	{"band4gain", ROOMEQ_BAND4GAIN, .set=setfixed, .new=newfixed, .min=-200, .max=200, .scale=0.1},
+	{"band4freq", ROOMEQ_BAND4FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band4q", ROOMEQ_BAND4Q, .set=setfixed, .new=newfixed, .min=4, .max=99, .scale=0.1},
+	{"band5gain", ROOMEQ_BAND5GAIN, .set=setfixed, .new=newfixed, .min=-200, .max=200, .scale=0.1},
+	{"band5freq", ROOMEQ_BAND5FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band5q", ROOMEQ_BAND5Q, .set=setfixed, .new=newfixed, .min=4, .max=99, .scale=0.1},
+	{"band6gain", ROOMEQ_BAND6GAIN, .set=setfixed, .new=newfixed, .min=-200, .max=200, .scale=0.1},
+	{"band6freq", ROOMEQ_BAND6FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band6q", ROOMEQ_BAND6Q, .set=setfixed, .new=newfixed, .min=4, .max=99, .scale=0.1},
+	{"band7gain", ROOMEQ_BAND7GAIN, .set=setfixed, .new=newfixed, .min=-200, .max=200, .scale=0.1},
+	{"band7freq", ROOMEQ_BAND7FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band7q", ROOMEQ_BAND7Q, .set=setfixed, .new=newfixed, .min=4, .max=99, .scale=0.1},
+	{"band8type", ROOMEQ_BAND8TYPE, .set=setenum, .new=newenum, .names=(const char *const[]){
+		"Peak", "High Shelf", "Low Pass", "High Pass",
+	}, .nameslen=4},
+	{"band8gain", ROOMEQ_BAND8GAIN, .set=setfixed, .new=newfixed, .min=-200, .max=200, .scale=0.1},
+	{"band8freq", ROOMEQ_BAND8FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band8q", ROOMEQ_BAND8Q, .set=setfixed, .new=newfixed, .min=4, .max=99, .scale=0.1},
+	{"band9type", ROOMEQ_BAND9TYPE, .set=setenum, .new=newenum, .names=(const char *const[]){
+		"Peak", "High Shelf", "Low Pass", "High Pass",
+	}, .nameslen=4},
+	{"band9gain", ROOMEQ_BAND9GAIN, .set=setfixed, .new=newfixed, .min=-200, .max=200, .scale=0.1},
+	{"band9freq", ROOMEQ_BAND9FREQ, .set=setint, .new=newint, .min=20, .max=20000},
+	{"band9q", ROOMEQ_BAND9Q, .set=setfixed, .new=newfixed, .min=4, .max=99, .scale=0.1},
+	{0},
+};
+
+static const char *const programkey_names[] = {
+	"Default", "Load Setup 1", "Load Setup 2", "Load Setup 3", "Load Setup 4", "Load Setup 5", "Load Setup 6",
+	"DIM", "Recall", "Mute Enable", "Main Mono", "Main Mute",
+	"Main Out Low Cut", "Main Out EQ", "Main Out Dynamics", "Main Out AutoLevel",
+	"Phones 9/10 Mute", "Phones 9/10 Low Cut", "Phones 9/10 EQ", "Phones 9/10 Dynamics", "Phones 9/10 AutoLevel",
+	"Phones 11/12 Mute", "Phones 11/12 Low Cut", "Phones 11/12 EQ", "Phones 11/12 Dynamics", "Phones 11/12 AutoLevel",
+	"Reverb enable", "Echo enable",
+	"Durec Record", "Durec Play/Pause", "Durec Stop", "Durec Previous", "Durec Next",
+	"TotalMix",
+};
+#define PROGRAMKEY_NAMESLEN (sizeof(programkey_names)/sizeof(programkey_names[0]))
+
+static const struct node roottree[] = {
+	{"input", .set=setchannel, .new=newchannel, .tree=(const struct node[]){
+		{"mute", INPUT_MUTE, .set=setinputmute, .new=newinputmute},
+		{"fx", INPUT_FXSEND, .set=setfixed, .new=newfixed, .min=-650, .max=0, .scale=0.1},
+		{"stereo", INPUT_STEREO, .set=setinputstereo, .new=newinputstereo},
+		{"record", INPUT_RECORD, .set=setbool, .new=newbool},
+		{"name", NAME, .set=setname, .new=newname},
+		{"playchan", INPUT_PLAYCHAN, .set=setint, .new=newint, .min=1, .max=60},
+		{"width", INPUT_WIDTH, .set=setint, .new=newint, .min=-100, .max=100},
+		{"msproc", INPUT_MSPROC, .set=setbool, .new=newbool},
+		{"phase", INPUT_PHASE, .set=setbool, .new=newbool},
+		{"gain", INPUT_GAIN, .set=setinputgain, .new=newinputgain},
+		{"reflevel", INPUT_REFLEVEL, .set=setint, .new=newinputreflevel},
+		{"48v", INPUT_48V, .set=setbool, .new=newbool},
+		{"autoset", INPUT_AUTOSET, .set=setbool, .new=newbool},
+		{"hi-z", INPUT_HIZ, .set=setbool, .new=newinputhiz},
+		{"lowcut", LOWCUT, .set=setbool, .new=newbool, .tree=lowcuttree},
+		{"eq", EQ, .set=setbool, .new=newbool, .tree=eqtree},
+		{"dynamics", DYNAMICS, .set=setbool, .new=newbool, .tree=dynamicstree},
+		{"autolevel", AUTOLEVEL, .set=setbool, .new=newbool, .tree=autoleveltree},
+		{0},
+	}},
+	{"output", .set=setchannel, .new=newchannel, .tree=(const struct node[]){
+		{"volume", OUTPUT_VOLUME, .set=setfixed, .new=newfixed, .scale=0.1, .min=-65.0, .max=6.0},
+		{"pan", OUTPUT_PAN, .set=setint, .new=newint, .min=-100, .max=100},
+		{"mute", OUTPUT_MUTE, .set=setbool, .new=newbool},
+		{"fx", OUTPUT_FXRETURN, .set=setfixed, .new=newfixed, .scale=0.1, .min=-65.0, .max=0.0},
+		{"stereo", OUTPUT_STEREO, .set=setbool, .new=newoutputstereo},
+		{"record", OUTPUT_RECORD, .set=setbool, .new=newbool},
+		{"name", NAME, .set=setname, .new=newname},
+		{"playchan", OUTPUT_PLAYCHAN, .set=setint, .new=newint},
+		{"phase", OUTPUT_PHASE, .set=setbool, .new=newbool},
+		{"reflevel", OUTPUT_REFLEVEL, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"+4dBu", "+13dBu", "+19dBu", "+24dBu",
+		}, .nameslen=4},
+		{"crossfeed", OUTPUT_CROSSFEED, .set=setint, .new=newint},
+		{"volumecal", OUTPUT_VOLUMECAL, .set=setfixed, .new=newfixed, .min=-2400, .max=300, .scale=0.01},
+		{"lowcut", LOWCUT, .set=setbool, .new=newbool, .tree=lowcuttree},
+		{"eq", EQ, .set=setbool, .new=newbool, .tree=eqtree},
+		{"dynamics", DYNAMICS, .set=setbool, .new=newbool, .tree=dynamicstree},
+		{"autolevel", AUTOLEVEL, .set=setbool, .new=newbool, .tree=autoleveltree},
+		{"roomeq", ROOMEQ, .set=setbool, .new=newbool, .tree=roomeqtree},
+		{"loopback", .new=newbool, .set=setoutputloopback},
+		{0},
+	}},
+	{"playback", .set=setchannel, .tree=(const struct node[]){
+		{"mute", .set=setinputmute},
+		{"stereo", .set=setinputstereo},
+		{0},
+	}},
+	{"mix", MIX, .set=setmix, .new=newmix},
+	{"solo", .set=setsolo},
+	{"reverb", REVERB, .set=setbool, .new=newbool, .tree=(const struct node[]){
+		{"type", REVERB_TYPE, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Small Room", "Medium Room", "Large Room", "Walls",
+			"Shorty", "Attack", "Swagger", "Old School",
+			"Echoistic", "8plus9", "Grand Wide", "Thicker",
+			"Envelope", "Gated", "Space",
+		}, .nameslen=15},
+		{"predelay", REVERB_PREDELAY, .set=setint, .new=newint},
+		{"lowcut", REVERB_LOWCUT, .set=setint, .new=newint},
+		{"roomscale", REVERB_ROOMSCALE, .set=setfixed, .new=newfixed, .scale=0.01},
+		{"attack", REVERB_ATTACK, .set=setint, .new=newint},
+		{"hold", REVERB_HOLD, .set=setint, .new=newint},
+		{"release", REVERB_RELEASE, .set=setint, .new=newint},
+		{"highcut", REVERB_HIGHCUT, .set=setint, .new=newint},
+		{"time", REVERB_TIME, .set=setfixed, .new=newfixed, .scale=0.1},
+		{"highdamp", REVERB_HIGHDAMP, .set=setint, .new=newint},
+		{"smooth", REVERB_SMOOTH, .set=setint, .new=newint},
+		{"volume", REVERB_VOLUME, .set=setfixed, .new=newfixed, .scale=0.1},
+		{"width", REVERB_WIDTH, .set=setfixed, .new=newfixed, .scale=0.01},
+		{0},
+	}},
+	{"echo", ECHO, .set=setbool, .new=newbool, .tree=(const struct node[]){
+		{"type", ECHO_TYPE, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Stereo Echo",
+			"Stereo Cross",
+			"Pong Echo",
+		}, .nameslen=3},
+		{"delay", ECHO_DELAY, .set=setfixed, .new=newfixed, .scale=0.001, .min=0, .max=2000},
+		{"feedback", ECHO_FEEDBACK, .set=setint, .new=newint},
+		{"highcut", ECHO_HIGHCUT, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Off", "16kHz", "12kHz", "8kHz", "4kHz", "2kHz",
+		}, .nameslen=6},
+		{"volume", ECHO_VOLUME, .set=setfixed, .new=newfixed, .scale=0.1, .min=-650, .max=60},
+		{"width", ECHO_WIDTH, .set=setfixed, .new=newfixed, .scale=0.01},
+		{0},
+	}},
+	{"controlroom", .tree=(const struct node[]){
+		{"mainout", CTLROOM_MAINOUT, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"1/2", "3/4", "5/6", "7/8", "9/10",
+			"11/12", "13/14", "15/16", "17/18", "19/20",
+			"21/22", "23/24", "25/26", "27/28", "29/30",
+			"31/32", "33/34", "35/36", "37/38", "39/40",
+			"41/42", "43/44", "45/46", "47/48", "49/50",
+			"51/52", "53/54", "55/56", "57/58", "59/60",
+			"61/62", "63/64", "65/66", "67/68", "69/70",
+			"71/72", "73/74", "75/76", "77/78", "79/80",
+			"81/82", "83/84", "85/86", "87/88", "89/90",
+			"91/92", "93/94",
+		}, .nameslen=47},
+		{"mainmono", CTLROOM_MAINMONO, .set=setbool, .new=newbool},
+		{"muteenable", CTLROOM_MUTEENABLE, .set=setbool, .new=newbool},
+		{"dimreduction", CTLROOM_DIMREDUCTION, .set=setfixed, .new=newfixed, .scale=0.1, .min=-650, .max=0},
+		{"dim", CTLROOM_DIM, .set=setbool, .new=newdim},
+		{"recallvolume", CTLROOM_RECALLVOLUME, .set=setfixed, .new=newfixed, .scale=0.1, .min=-650, .max=0},
+		{0},
+	}},
+	{"clock", .tree=(const struct node[]){
+		{"source", CLOCK_SOURCE, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Internal", "Word Clock", "AES", "Opt. 1", "Opt. 2", "MADI Opt.", "MADI Coax.",
+		}, .nameslen=7},
+		{"samplerate", CLOCK_SAMPLERATE, .new=newsamplerate},
+		{"wckout", CLOCK_WCKOUT, .set=setbool, .new=newbool},
+		{"wcksingle", CLOCK_WCKSINGLE, .set=setbool, .new=newbool},
+		{"wckterm", CLOCK_WCKTERM, .set=setbool, .new=newbool},
+		{0},
+	}},
+	{"setup", .tree=(const struct node[]){
+		{"store", SETUP_STORE, .set=setsetupstore, .new=NULL, .names=(const char *const[]){
+			"Slot 1", "Slot 2", "Slot 3", "Slot 4", "Slot 5", "Slot 6",
+		}, .nameslen=6},
+		{"arcleds", SETUP_ARCLEDS, .set=setsetuparcleds, .new=NULL, .names=(const char *const[]){
+			"LED 1", "LED 2", "LED 3", "LED 4", "LED 5", "LED 6", "LED 7", "LED 8",
+			"LED 9", "LED 10", "LED 11", "LED 12", "LED 13", "LED 14",
+			"LED 15",
+		}, .nameslen=15},
+		{0},
+	}},
+	{"hardware", .tree=(const struct node[]){
+		{"aesin", HARDWARE_AESIN , .set=setenum, .new=newenum, .names=(const char *const[]){
+			"XLR", "Opt. 2",
+		}, .nameslen=2},
+		{"opticalin", HARDWARE_OPTICALIN, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"ADAT", "SPDIF",
+		}, .nameslen=2},
+		{"opticalin2", HARDWARE_OPTICALIN2, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"ADAT 2", "SPDIF",
+		}, .nameslen=2},
+		{"opticalout", HARDWARE_OPTICALOUT, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"ADAT", "SPDIF",
+		}, .nameslen=2},
+		{"opticalout2", HARDWARE_OPTICALOUT2, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"ADAT 2", "SPDIF", "AES",
+		}, .nameslen=3},
+		{"spdifout", HARDWARE_SPDIFOUT, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Consumer", "Professional",
+		}, .nameslen=2},
+		{"ccmode", HARDWARE_CCMODE, .new=newbool},
+		{"ccmix", HARDWARE_CCMIX, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"TotalMix App", "6ch + phones", "8ch", "20ch",
+		}, .nameslen=4},
+		{"interfacemode", HARDWARE_INTERFACEMODE, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Auto", "USB2", "USB3", "CC",
+		}, .nameslen=4},
+		{"ccrouting", HARDWARE_CCROUTING, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"All Ch.", "Phones",
+		}, .nameslen=2},
+		{"standalonemidi", HARDWARE_STANDALONEMIDI, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Off", "MIDI 1", "MIDI 2", "MADI Opt.", "MADI Coax.",
+		}, .nameslen=5},
+		{"standalonearc", HARDWARE_STANDALONEARC, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Volume", "1s Op", "Normal",
+		}, .nameslen=3},
+		{"lockkeys", HARDWARE_LOCKKEYS, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Off", "Keys", "All",
+		}, .nameslen=3},
+		{"remapkeys", HARDWARE_REMAPKEYS, .set=setbool, .new=newbool},
+		{"programkey01", HARDWARE_PROGRAMKEY01, .set=setenum, .new=newenum, .names=programkey_names, .nameslen=PROGRAMKEY_NAMESLEN},
+		{"programkey02", HARDWARE_PROGRAMKEY02, .set=setenum, .new=newenum, .names=programkey_names, .nameslen=PROGRAMKEY_NAMESLEN},
+		{"programkey03", HARDWARE_PROGRAMKEY03, .set=setenum, .new=newenum, .names=programkey_names, .nameslen=PROGRAMKEY_NAMESLEN},
+		{"programkey04", HARDWARE_PROGRAMKEY04, .set=setenum, .new=newenum, .names=programkey_names, .nameslen=PROGRAMKEY_NAMESLEN},
+		{"lcdcontrast", HARDWARE_LCDCONTRAST, .set=setint, .new=newint},
+		{"madiinput", HARDWARE_MADIINPUT, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Optical", "Coaxial", "Auto", "Split"
+		}, .nameslen=4},
+		{"madioutput", HARDWARE_MADIOUTPUT, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"Optical", "Mirror", "Split"
+		}, .nameslen=3},
+		{"madiframe", HARDWARE_MADIFRAME, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"96K Frame", "48K Frame"
+		}, .nameslen=2},
+		{"madiformat", HARDWARE_MADIFORMAT, .set=setenum, .new=newenum, .names=(const char *const[]){
+			"56 (28) ch", "64 (32 ch)"
+		}, .nameslen=2},
+		{"eqdrecord", .set=seteqdrecord},
+		{NULL, HARDWARE_DSPVERLOAD, .new=newdspload},
+		{NULL, HARDWARE_DSPAVAIL, .new=newdspavail},
+		{NULL, HARDWARE_DSPSTATUS, .new=newdspstatus},
+		{NULL, HARDWARE_ARCDELTA, .new=newarcdelta},
+		{NULL, HARDWARE_ARCBUTTONS, .new=newarcbuttons},
+		{0},
+	}},
+	{"durec", .tree=(const struct node[]){
+		{"play", DUREC_CONTROL, .set=setdurecplay},
+		{"stop", DUREC_CONTROL, .set=setdurecstop},
+		{"record", DUREC_CONTROL, .set=setdurecrecord},
+		{"stoprecord", DUREC_CONTROL, .set=setdurecstoprecord},
+		{"delete", DUREC_DELETE, .set=setdurecdelete},
+		{"file", DUREC_FILE, .set=setdurecfile, .new=newdurecfile},
+		{NULL, DUREC_STATUS, .new=newdurecstatus},
+		{NULL, DUREC_TIME, .new=newdurectime},
+		{NULL, DUREC_USBLOAD, .new=newdurecusbstatus},
+		{NULL, DUREC_TOTALSPACE, .new=newdurectotalspace},
+		{NULL, DUREC_FREESPACE, .new=newdurecfreespace},
+		{NULL, DUREC_NUMFILES, .new=newdurecfileslen},
+		{NULL, DUREC_NEXT, .new=newdurecnext},
+		{NULL, DUREC_RECORDTIME, .new=newdurecrecordtime},
+		{NULL, DUREC_INDEX, .new=newdurecindex},
+		{NULL, DUREC_NAME0, .new=newdurecname},
+		{NULL, DUREC_NAME1, .new=newdurecname},
+		{NULL, DUREC_NAME2, .new=newdurecname},
+		{NULL, DUREC_NAME3, .new=newdurecname},
+		{NULL, DUREC_INFO, .new=newdurecinfo},
+		{NULL, DUREC_LENGTH, .new=newdureclength},
+		{0},
+	}},
+	{"device", .tree=(const struct node[]){
+		{"info", .set=setdeviceinfo},
+		{"channels", .set=setdevicechannels},
+		{"names", .set=setdevicenames},
+		{0},
+	}},
+	{"debug", .set=setdebug},
+	{"metering", .set=setmetering},
+	{"refresh", REFRESH, .set=setrefresh},
+	{0},
+};
+
+/* maps control number to indices into roottree */
+static unsigned char nodeindex[NUMCTLS][4];
+
+int
+handleosc(const unsigned char *buf, size_t len)
+{
+	const struct node *node;
+	struct context ctx;
+	struct oscmsg msg;
+	const char *pattern;
+	char *end;
+	char addrbuf[256];
+	size_t plen;
+
+	if (len % 4 != 0)
+		return -1;
+	msg.err = NULL;
+	msg.buf = (unsigned char *)buf;
+	msg.end = (unsigned char *)buf + len;
+	msg.type = "ss";
+
+	pattern = oscgetstr(&msg);
+	msg.type = oscgetstr(&msg);
+	if (msg.err) {
+		fprintf(stderr, "invalid osc message: %s\n", msg.err);
+		return -1;
+	}
+	if (pattern[0] != '/') {
+		fprintf(stderr, "invalid osc address '%s'\n", pattern);
+		return -1;
+	}
+	if (msg.type[0] != ',') {
+		fprintf(stderr, "invalid osc types '%s'\n", msg.type);
+		return -1;
+	}
+	++msg.type;
+
+	/* Make the original request address available to set callbacks so they
+	 * can respond at the same address (used for no-args read requests). */
+	plen = strlen(pattern);
+	if (plen >= sizeof addrbuf)
+		plen = sizeof addrbuf - 1;
+	memcpy(addrbuf, pattern, plen);
+	addrbuf[plen] = '\0';
+	ctx.addr = addrbuf;
+	ctx.addrpos = addrbuf + plen;
+	ctx.addrend = addrbuf + sizeof addrbuf;
+
+	ctx.pattern = pattern;
+	ctx.param.in = ctx.param.out = -1;
+	for (node = roottree; ctx.pattern[0] && node && node->name;) {
+		if (!oscmatch(ctx.pattern, node->name, &end)) {
+			++node;
+			continue;
+		}
+		ctx.pattern = end;
+		ctx.node = node;
+		if (node->set) {
+			ctx.exact = !ctx.pattern[0];
+			node->set(&ctx, &msg);
+			if (msg.err)
+				fprintf(stderr, "%s: %s\n", pattern, msg.err);
+		}
+		node = node->tree;
+	}
+	return 0;
+}
+
+static unsigned char oscbuf[8192];
+static struct oscmsg oscmsg;
+
+static void
+oscsend(const char *addr, const char *type, ...)
+{
+	unsigned char *len;
+	va_list ap;
+
+	_Static_assert(sizeof(float) == sizeof(uint32_t), "unsupported float type");
+	assert(addr[0] == '/');
+	assert(type[0] == ',');
+
+	if (!oscmsg.buf) {
+		oscmsg.buf = oscbuf;
+		oscmsg.end = oscbuf + sizeof oscbuf;
+		oscmsg.type = NULL;
+		oscputstr(&oscmsg, "#bundle");
+		oscputint(&oscmsg, 0);
+		oscputint(&oscmsg, 1);
+	} else if (oscmsg.buf + 512 > oscmsg.end) {
+		/* Buffer nearly full: flush current bundle and start a new one */
+		oscflush();
+		oscmsg.buf = oscbuf;
+		oscmsg.end = oscbuf + sizeof oscbuf;
+		oscmsg.type = NULL;
+		oscputstr(&oscmsg, "#bundle");
+		oscputint(&oscmsg, 0);
+		oscputint(&oscmsg, 1);
+	}
+
+	len = oscmsg.buf;
+	oscmsg.type = NULL;
+	oscputint(&oscmsg, 0);
+	oscputstr(&oscmsg, addr);
+	oscputstr(&oscmsg, type);
+	oscmsg.type = ++type;
+	va_start(ap, type);
+	for (; *type; ++type) {
+		switch (*type) {
+			case 'f': oscputfloat(&oscmsg, va_arg(ap, double)); break;
+			case 'i': oscputint(&oscmsg, va_arg(ap, int)); break;
+			case 's': oscputstr(&oscmsg, va_arg(ap, const char *)); break;
+			default: assert(0);
+		}
+	}
+	va_end(ap);
+	putbe32(len, oscmsg.buf - len - 4);
+}
+
+static void
+oscsendenum(const char *addr, int val, const char *const names[], size_t nameslen)
+{
+	if (val >= 0 && val < nameslen) {
+		oscsend(addr, ",is", val, names[val]);
+	} else {
+		fprintf(stderr, "unknown value for '%s': %d\n", addr, val);
+		fprintf(stderr, "nameslen=%zu\n", nameslen);
+		fprintf(stderr, "unexpected enum value %d\n", val);
+
+		oscsend(addr, ",i", val);
+	}
+}
+
+static void
+oscflush(void)
+{
+	if (oscmsg.buf) {
+		writeosc(oscbuf, oscmsg.buf - oscbuf);
+		oscmsg.buf = NULL;
+	}
+}
+
+static void
+handleregs(uint_least32_t *payload, size_t len)
+{
+	size_t i;
+	struct context ctx;
+	enum control ctl;
+	int reg, val;
+	const struct node *tree, *node;
+	const unsigned char *idx, *end;
+	char addr[256];
+
+	ctx.addr = addr;
+	ctx.addrend = addr + sizeof addr;
+	for (i = 0; i < len; ++i) {
+		reg = payload[i] >> 16 & 0x7fff;
+		val = (long)((payload[i] & 0xffff) ^ 0x8000) - 0x8000;
+
+		/* Debug: Print NAME range registers with their values */
+		//if (reg >= 0x2800 && reg < 0x2C00) {
+		//	fprintf(stderr, "DEBUG handleregs: reg=0x%04X, val=0x%04X (%d)\n", reg, val & 0xFFFF, val);
+		//}
+
+		ctx.param.in = ctx.param.out = -1;
+		ctx.reg = reg;  /* Store actual register number */
+		ctl = device->regtoctl(reg, &ctx.param);
+		if (ctl == -1) {
+			if (dflag >= 4)
+				fprintf(stderr, "[DEBUG L%d] handleregs: ctl=-1 for [%.4X]=%.4X\n", dflag, reg, val & 0xFFFFU);
+			continue;
+		}
+		if (ctl == UNKNOWN)
+			continue;
+		assert(ctl < LEN(nodeindex));
+		assert(nodeindex[ctl][0] != 0xFF);
+
+		ctx.addrpos = addr;
+		tree = roottree;
+		for (idx = nodeindex[ctl], end = idx + sizeof nodeindex[ctl]; idx != end && *idx != 0xFF; ++idx) {
+			node = &tree[*idx];
+			if (node->name) {
+				*ctx.addrpos++ = '/';
+				ctx.addrpos = memccpy(ctx.addrpos, node->name, '\0', ctx.addrend - ctx.addrpos);
+				assert(ctx.addrpos);
+				--ctx.addrpos;
+			}
+			ctx.node = node;
+			if (node->new) {
+				ctx.exact = idx == end || idx[1] == 0xFF;
+				node->new(&ctx, val);
+			}
+			tree = node->tree;
+		}
+		if (dflag >= 2 &&
+			ctl != HARDWARE_DSPVERLOAD &&
+			ctl != HARDWARE_DSPAVAIL &&
+			ctl != HARDWARE_DSPSTATUS &&
+			ctl != HARDWARE_ARCDELTA &&
+			ctl != HARDWARE_ARCBUTTONS){
+				fprintf(stderr,  "[DEBUG L%d] handleregs: [%.4X]=%.4X  addr=%s  param.in=%d param.out=%d control=%u \n", dflag,	reg, val & 0xFFFFU, addr, ctx.param.in, ctx.param.out, ctx.node->ctl);
+		}
+		//if (dflag >= 4 && reg <= 0x4000 ){
+		//		fprintf(stderr, "[DEBUG L%d] handleregs: [%.4X]=%.4X  addr=%s  param.in=%d param.out=%d control=%u \n", dflag, reg, val & 0xFFFFU, addr, ctx.param.in, ctx.param.out, ctx.node->ctl);
+		//}
+	}
+}
+
+static void
+handlelevels(int subid, uint_least32_t *payload, size_t len)
+{
+	uint_least32_t peak, *peakfx;
+	uint_least64_t rms, *rmsfx;
+	float peakdb, peakfxdb, rmsdb, rmsfxdb;
+	const char *type;
+	char addr[128];
+	size_t i, maxfx;
+
+	if (len % 3 != 0) {
+		fprintf(stderr, "unexpected levels data\n");
+		return;
+	}
+	len /= 3;
+	type = NULL;
+	peakfx = NULL;
+	rmsfx = NULL;
+	switch (subid) {
+		case 4: type = "input";  /* fallthrough */
+		case 1: peakfx = inputpeakfx, rmsfx = inputrmsfx; break;
+		case 5: type = "output";  /* fallthrough */
+		case 3: peakfx = outputpeakfx, rmsfx = outputrmsfx; break;
+		case 2: type = "playback"; break;
+		default: assert(0);
+	}
+	/* clamp to allocated buffer size to guard against unexpected packet lengths */
+	maxfx = (peakfx == inputpeakfx ? device->inputslen : device->outputslen) + 2;
+	if (len > maxfx) {
+		fprintf(stderr, "levels packet too large: got %zu, expected <= %zu\n", len, maxfx);
+		len = maxfx;
+	}
+	for (i = 0; i < len; ++i) {
+		rms = *payload++;
+		rms |= (uint_least64_t)*payload++ << 32;
+		peak = *payload++;
+		if (type) {
+			peakdb = 20 * log10((peak >> 4) / 0x1p23);
+			rmsdb = 10 * log10(rms / 0x1p54);
+			snprintf(addr, sizeof addr, "/%s/%d/level", type, (int)i + 1);
+			if (peakfx) {
+				peakfxdb = 20 * log10((peakfx[i] >> 4) / 0x1p23);
+				rmsfxdb = 10 * log10(rmsfx[i] / 0x1p54);
+				oscsend(addr, ",ffffi", peakdb, rmsdb, peakfxdb, rmsfxdb, (int)(peak & peakfx[i] & 1));
+			} else {
+				oscsend(addr, ",ffi", peakdb, rmsdb, (int)(peak & 1));
+			}
+		} else {
+			*peakfx++ = peak;
+			*rmsfx++ = rms;
+		}
+	}
+}
+
+void
+handlesysex(const unsigned char *buf, size_t len, uint_least32_t *payload)
+{
+	struct sysex sysex;
+	int ret;
+	size_t i;
+	uint_least32_t *pos;
+
+	ret = sysexdec(&sysex, buf, len, SYSEX_MFRID | SYSEX_DEVID | SYSEX_SUBID);
+	if (ret != 0 || sysex.mfrid != 0x200d || sysex.devid != 0x10 || sysex.datalen % 5 != 0) {
+		if (ret == 0)
+			fprintf(stderr, "ignoring unknown sysex packet (mfr=%x devid=%x datalen=%zu)\n", sysex.mfrid, sysex.devid, sysex.datalen);
+		else
+			fprintf(stderr, "ignoring unknown sysex packet\n");
+		return;
+	}
+	pos = payload;
+	for (i = 0; i < sysex.datalen; i += 5)
+		*pos++ = getle32_7bit(sysex.data + i);
+	switch (sysex.subid) {
+		case 0:
+			handleregs(payload, pos - payload);
+			fflush(stdout);
+			fflush(stderr);
+			break;
+		case 1: case 2: case 3: case 4: case 5:
+			handlelevels(sysex.subid, payload, pos - payload);
+			break;
+		default:
+			fprintf(stderr, "ignoring unknown sysex sub ID\n");
+	}
+	oscflush();
+}
+
+void
+handletimer(bool levels)
+{
+	static int serial;
+	unsigned char buf[7];
+
+	if (levels && metering_enabled) {
+		/* XXX: ~60 times per second levels, ~30 times per second serial */
+		writesysex(2, NULL, 0, buf);
+	}
+
+	setreg(0x3F00, serial);
+	serial = (serial + 1) & 0xf;
+}
+
+static void
+maptree(const struct node *tree, int i)
+{
+	static unsigned char index[sizeof nodeindex[0]];
+	const struct node *node;
+
+	assert(i < sizeof index);
+	index[i] = 0;
+	for (node = tree; node->set || node->new || node->tree; ++node, ++index[i]) {
+		if (node->ctl) {
+			memcpy(nodeindex[node->ctl], index, i + 1);
+			memset(nodeindex[node->ctl] + i + 1, 0xFF, sizeof index - (i + 1));
+		}
+		if (node->tree)
+			maptree(node->tree, i + 1);
+	}
+}
+
+int
+init(const char *port)
+{
+	extern const struct device ff802;
+	extern const struct device ffucx;
+	extern const struct device ffucxii;
+	extern const struct device ffufx;
+	extern const struct device ffufxii;
+	extern const struct device ffufxiii;
+	extern const struct device ffufxp;
+	static const struct device *devices[] = {
+		&ff802, &ffucx, &ffucxii, &ffufx, &ffufxii, &ffufxiii, &ffufxp
+	};
+	const struct device *sorted[LEN(devices)];
+	size_t lens[LEN(devices)];
+	int i, j;
+
+	/*
+	 * Match by sorting candidates by name length (descending) then taking
+	 * the first whose name is a prefix of port followed by a strict
+	 * boundary char ('\0', ' ', or '('). This makes matching independent
+	 * of array order and prevents "Fireface UFX" from ever matching
+	 * "Fireface UFX+" / "Fireface UFX II" / "Fireface UFX III".
+	 */
+	for (i = 0; i < (int)LEN(devices); ++i) {
+		sorted[i] = devices[i];
+		lens[i] = strlen(devices[i]->name);
+	}
+	for (i = 1; i < (int)LEN(devices); ++i) {
+		for (j = i; j > 0 && lens[j] > lens[j - 1]; --j) {
+			const struct device *td = sorted[j];
+			size_t tl = lens[j];
+			sorted[j] = sorted[j - 1]; lens[j] = lens[j - 1];
+			sorted[j - 1] = td; lens[j - 1] = tl;
+		}
+	}
+
+	device = NULL;
+	for (i = 0; i < (int)LEN(devices); ++i) {
+		const char *name = sorted[i]->name;
+		size_t nlen = lens[i];
+		if (strcmp(port, sorted[i]->id) == 0) {
+			device = sorted[i];
+			break;
+		}
+		if (strncmp(port, name, nlen) == 0) {
+			char c = port[nlen];
+			if (c == '\0' || c == ' ' || c == '(') {
+				device = sorted[i];
+				break;
+			}
+		}
+	}
+	if (!device) {
+		fprintf(stderr, "Unsupported Device: '%s'\n", port);
+		return -1;
+	}
+
+	makedeviceuid(port, deviceuid, sizeof deviceuid);
+	fprintf(stderr, "Device Name: %s (ID: %s)\n", device->name, device->id);
+	fprintf(stderr, "Device UID:  %s\n", deviceuid);
+	fprintf(stderr, "MIDI Port:   %s\n", port);
+
+	memset(nodeindex, 0xFF, sizeof nodeindex);
+	maptree(roottree, 0);
+
+	inputs = calloc(device->inputslen + device->outputslen, sizeof *inputs);
+	outputs = calloc(device->outputslen, sizeof *outputs);
+	inputpeakfx = calloc(device->inputslen + 2, sizeof *inputpeakfx);
+	outputpeakfx = calloc(device->outputslen + 2, sizeof *outputpeakfx);
+	inputrmsfx = calloc(device->inputslen + 2, sizeof *inputrmsfx);
+	outputrmsfx = calloc(device->outputslen + 2, sizeof *outputrmsfx);
+	if (!inputs || !outputs || !inputpeakfx || !outputpeakfx || !inputrmsfx || !outputrmsfx) {
+		perror(NULL);
+		return -1;
+	}
+	for (i = 0; i < device->inputslen + device->outputslen; ++i) {
+		struct input *in;
+
+		in = &inputs[i];
+		in->width = 100;
+	}
+	for (i = 0; i < device->outputslen; ++i) {
+		struct output *out;
+
+		inputs[device->inputslen + i].stereo = true;
+		out = &outputs[i];
+		out->mix = calloc(device->inputslen + device->outputslen, sizeof *out->mix);
+		out->solo = calloc(device->inputslen + device->outputslen, sizeof *out->solo);
+		if (!out->mix || !out->solo) {
+			perror(NULL);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+void
+oscmix_getdevinfo(struct oscmix_devinfo *out)
+{
+	out->id      = device ? device->id : NULL;
+	out->uid     = deviceuid;
+	out->flags   = device ? device->flags : 0;
+	out->inputs  = device ? device->inputslen : 0;
+	out->outputs = device ? device->outputslen : 0;
+}

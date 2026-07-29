@@ -1,0 +1,90 @@
+.Dd April 19, 2026
+.Dt ALSASEQIO 1
+.Os
+.Sh NAME
+.Nm alsaseqio
+.Nd ALSA sequencer I/O bridge
+.Sh SYNOPSIS
+.Nm
+.Op Fl n Ar name
+.Ar client Ns : Ns Ar port
+.Ar command Op Ar arg ...
+.Nm
+.Fl n Ar name
+.Ar command Op Ar arg ...
+.Sh DESCRIPTION
+.Nm
+is a bridge between MIDI byte streams and an ALSA sequencer port.
+It sets up file descriptors for reading and writing MIDI messages and
+executes a
+.Ar command
+with those file descriptors available for MIDI I/O.
+.Pp
+.Nm
+forks to the background and executes
+.Ar command
+in the foreground, with file descriptors 6 and 7 configured for
+MIDI input and output respectively.
+.Pp
+The
+.Ar command
+can read MIDI messages from file descriptor 6 and write MIDI messages
+to file descriptor 7.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl n Ar name
+Create a virtual ALSA sequencer port with the given name instead of
+connecting to an existing port.
+Other ALSA sequencer clients can connect to this port using
+.Xr aconnect 1 .
+.El
+.Sh ARGUMENTS
+.Bl -tag -width Ds
+.It Ar client Ns : Ns Ar port
+The ALSA sequencer client and port number to connect to (e.g., 128:0).
+Omit when using
+.Fl n .
+.It Ar command
+The program to execute with MIDI I/O on file descriptors 6 and 7.
+.It Ar arg
+Optional arguments passed to
+.Ar command .
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width MIDIPORT
+.It Ev MIDIPORT
+Set to the name of the connected or created port before executing
+.Ar command .
+.El
+.Sh EXAMPLES
+Connect to ALSA sequencer port 128:0 and start oscmix:
+.Pp
+.Dl alsaseqio 128:0 oscmix
+.Pp
+Connect to a Fireface UFX III port 4 and start oscmix with multicast:
+.Pp
+.Dl alsaseqio 'Fireface UFX III:4' oscmix
+.Pp
+Create a virtual port named "Fireface 802 (12345678) Port 2" and start oscmix in debug mode:
+.Pp
+.Dl alsaseqio -n \(dqFireface 802 (12345678) Port 2\(dq oscmix -d
+.Pp
+List available ALSA sequencer ports:
+.Pp
+.Dl aconnect -l
+.Pp
+Connect another application to the virtual port:
+.Pp
+.Dl aconnect 'Some MIDI App' alsaseqio
+.Sh AVAILABILITY
+.Nm
+is only available on
+.Tn Linux .
+On macOS, use
+.Xr coremidiio 1
+instead.
+.Sh SEE ALSO
+.Xr aconnect 1 ,
+.Xr alsarawio 1 ,
+.Xr coremidiio 1 ,
+.Xr oscmix 1
