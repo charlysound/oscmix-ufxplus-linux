@@ -502,12 +502,12 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version-info.outputs.release_tag }}
           name: ${{ needs.version-info.outputs.release_name }}
           body: ${{ steps.release-notes.outputs.body }}
-          prerelease: false
+          prerelease: ${{ contains(needs.version-info.outputs.release_tag, '-') }}
           draft: false
           make_latest: true
           files: |
